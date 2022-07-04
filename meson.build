@@ -142,6 +142,11 @@ elif host_machine.system() == 'dripos'
 	rtdl_include_dirs += include_directories('sysdeps/dripos/include')
 	libc_include_dirs += include_directories('sysdeps/dripos/include')
 	subdir('sysdeps/dripos')
+elif host_machine.system() == 'naos'
+	disable_linux_option = true
+	rtdl_include_dirs += include_directories('sysdeps/naos/include')
+	libc_include_dirs += include_directories('sysdeps/naos/include')
+	subdir('sysdeps/naos')
 else
 	error('No sysdeps defined for OS: ' + host_machine.system())
 endif
