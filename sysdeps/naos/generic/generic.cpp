@@ -1,3 +1,4 @@
+#include "mlibc/posix-sysdeps.hpp"
 #include "sysdeps/linux/include/abi-bits/seek-whence.h"
 #include <abi-bits/seek-whence.h>
 #include <abi-bits/stat.h>
@@ -13,6 +14,7 @@
 #include <mlibc/all-sysdeps.hpp>
 #include <mlibc/debug.hpp>
 #include <mlibc/fsfd_target.hpp>
+#include <string.h>
 
 #define SYS_CALL(index, ret, name, ...)                                                                                \
     extern "C" ret name(__VA_ARGS__);                                                                                  \
@@ -79,27 +81,28 @@ SYS_CALL(17, int, _s_fallocate, fd_t fd);
 // SYS_CALL(10, int64_t, _s_get_pipe, fd_t *fd1, fd_t *fd2)
 // SYS_CALL(11, int, _s_create_fifo, const char *path, uint64_t mode)
 
-struct list_directory_cursor
+struct dentry
 {
-    uint32_t size;
-    int64_t cursor;
+    uint64_t inode;
+    uint32_t name_offset; // offset of entry_name_buffer
+    uint32_t type;
 };
 
-struct list_directory_result
+struct dentries
 {
-    list_directory_cursor cursor;
-    uint32_t num_files;
-    char *files_buffer;
-    uint32_t bytes;
-    char *buffer;
+    int64_t offset;
+    char *entry_name_buffer;
+    uint64_t buffer_size;
+    uint64_t entry_count;
+    dentry entry[0];
 };
 
 SYS_CALL(18, int, _s_open_dir, const char *path);
-SYS_CALL(19, int, _s_list_dir, fd_t fd, list_directory_result *result);
+SYS_CALL(19, int, _s_list_dir, fd_t fd, dentries *entries);
 SYS_CALL(20, int, _s_access, const char *path, int64_t mode);
 
-SYS_CALL(22, int, _s_unlink, const char *target)
-SYS_CALL(23, int, _s_mkdir, const char *path)
+SYS_CALL(22, int, _s_unlink, fd_t fd, const char *path, uint64_t flags)
+SYS_CALL(23, int, _s_mkdir, const char *path, int64_t mode);
 SYS_CALL(24, int, _s_rmdir, const char *path)
 SYS_CALL(25, int, _s_rename, const char *src, const char *target);
 SYS_CALL(26, int, _s_create, const char *filepath)
@@ -197,7 +200,7 @@ SYS_CALL(44, void, _s_sigwait, int *num, sig_info_t *info)
 SYS_CALL(45, int, _s_sigmask, int opt, sig_mask_t *valid, sig_mask_t *block, sig_mask_t *ignore)
 
 SYS_CALL(46, int, _s_chdir, const char *new_workpath)
-SYS_CALL(47, int64_t, _s_current_dir, char *path, uint64_t max_len)
+SYS_CALL(47, int, _s_current_dir, char *path, uint64_t max_len)
 SYS_CALL(48, int, _s_chroot, const char *path)
 
 SYS_CALL(49, int, _s_get_cpu_running)
@@ -272,7 +275,7 @@ int sys_futex_wait(int *pointer, int expected, const struct timespec *time)
         return _s_futex(pointer, FUTEX_WAIT, expected, nullptr);
     }
 }
-int sys_futex_wake(int *pointer) { _s_futex(pointer, FUTEX_WAKE, 0, nullptr); }
+int sys_futex_wake(int *pointer) { return _s_futex(pointer, FUTEX_WAKE, 0, nullptr); }
 
 int sys_anon_allocate(size_t size, void **pointer)
 {
@@ -331,6 +334,28 @@ int sys_seek(int fd, off_t offset, int whence, off_t *new_offset)
     return ret;
 }
 
+int sys_pread(int fd, void *buf, size_t n, off_t off, ssize_t *bytes_read)
+{
+    int64_t ret = _s_pread(off, fd, (char *)buf, n, 0);
+    if (ret >= 0)
+    {
+        *bytes_read = ret;
+        return 0;
+    }
+    return ret;
+}
+
+int sys_pwrite(int fd, const void *buf, size_t n, off_t off, ssize_t *bytes_written)
+{
+    int64_t ret = _s_pwrite(off, fd, (const char *)buf, n, 0);
+    if (ret >= 0)
+    {
+        *bytes_written = ret;
+        return 0;
+    }
+    return ret;
+}
+
 int sys_close(int fd) { return _s_close(fd); }
 
 int sys_isatty(int fd) { return _s_istty(fd); }
@@ -350,6 +375,7 @@ int sys_vm_map(void *hint, size_t size, int prot, int flags, int fd, off_t offse
 int sys_vm_unmap(void *pointer, size_t size) { return _s_mumap(pointer, size); }
 
 void sys_yield() { _s_yield(); }
+
 int sys_sleep(time_t *secs, long *nanos)
 {
     time_clock c;
@@ -391,11 +417,78 @@ int sys_execve(const char *path, char *const argv[], char *const envp[]) { retur
 int sys_waitpid(pid_t pid, int *status, int flags, pid_t *ret_pid)
 {
     int64_t ret;
-    int64_t r = _s_wait_process(pid, &ret);
+    int64_t opid = pid;
+    int64_t r = _s_wait_process(opid, &ret);
     *status = ret;
     return r;
 }
 
 int sys_access(const char *path, int mode) { return _s_access(path, mode); }
+
+int sys_getcwd(char *buffer, size_t size) { return _s_current_dir(buffer, size); }
+
+int sys_chdir(const char *path) { return _s_chdir(path); }
+
+int sys_open_dir(const char *path, int *handle)
+{
+    int fd = _s_open_dir(path);
+    if (fd > 0)
+    {
+        *handle = fd;
+    }
+    return 0;
+}
+
+int sys_read_entries(int handle, void *buffer, size_t max_size, size_t *bytes_read)
+{
+    constexpr uint64_t buf_size = 2048;
+    // dirent *dirent = reinterpret_cast<dirent *>(buffer);
+    char buf[buf_size];
+    memset(buf, 0, sizeof(buf));
+
+    dentries *entries = (reinterpret_cast<dentries *>(&buf));
+    dirent *dir = (dirent *)buffer;
+
+    entries->offset = dir->d_off;
+    entries->entry_count = 1;
+    entries->entry_name_buffer = buf + sizeof(dentries) + sizeof(dentry) + 1;
+    entries->buffer_size = buf + buf_size - entries->entry_name_buffer;
+    int ret = _s_list_dir(handle, entries);
+    if (ret == 0)
+    {
+        if (entries->entry_count >= 1)
+        {
+            dirent *dir = (dirent *)buffer;
+            auto &entry = entries->entry[0];
+            strcpy(dir->d_name, entries->entry_name_buffer + entry.name_offset);
+            dir->d_ino = entry.inode;
+            dir->d_off = entries->offset;
+            dir->d_reclen = sizeof(dirent);
+            dir->d_type = entry.type;
+
+            *bytes_read = sizeof(dirent);
+        }
+        else
+        {
+            *bytes_read = 0;
+        }
+
+        return 0;
+    }
+    return ret;
+}
+
+int sys_rmdir(const char *path) { return _s_rmdir(path); }
+
+int sys_mkdir(const char *path, mode_t mode) { return _s_mkdir(path, mode); }
+
+int sys_unlinkat(int fd, const char *path, int flags)
+{
+    if (fd == AT_FDCWD)
+    {
+        fd = -1;
+    }
+    return _s_unlink(fd, path, flags);
+}
 
 } // namespace mlibc
