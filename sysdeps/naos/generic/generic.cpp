@@ -1,3 +1,4 @@
+#include "abi-bits/abi.h"
 #include "mlibc/posix-sysdeps.hpp"
 #include "sysdeps/linux/include/abi-bits/seek-whence.h"
 #include <abi-bits/seek-whence.h>
@@ -46,6 +47,7 @@ SYS_CALL(2, int, _s_clock, int clock_index, time_clock *clock);
 #define OPEN_MODE_WRITE 2
 #define OPEN_MODE_BIN 4
 #define OPEN_MODE_APPEND 8
+#define OPEN_MODE_UNLINK_ON_CLOSE 32
 
 #define STDIN 0
 #define STDOUT 1
@@ -53,6 +55,12 @@ SYS_CALL(2, int, _s_clock, int clock_index, time_clock *clock);
 typedef int fd_t;
 
 #define OPEN_ATTR_AUTO_CREATE_FILE 1
+#define OPEN_ATTR_TRUNC 256
+#define OPEN_ATTR_APPEND 2048
+#define OPEN_ATTR_WRITE 512
+#define OPEN_ATTR_EXEC 1024
+#define OPEN_ATTR_FILE 32
+
 #define RWFLAGS_NO_BLOCK 1
 #define RWFLAGS_OVERRIDE 2
 
@@ -292,7 +300,34 @@ int sys_anon_free(void *pointer, size_t size) { return _s_mumap(pointer, size); 
 
 int sys_open(const char *pathname, int flags, mode_t mode, int *fd)
 {
-    int f = _s_open(pathname, mode, flags);
+    uint64_t attr = OPEN_ATTR_FILE;
+    uint64_t m = 0;
+    if (flags & __MLIBC_O_CREAT)
+    {
+        attr |= OPEN_ATTR_AUTO_CREATE_FILE;
+    }
+    if (flags & __MLIBC_O_TRUNC)
+    {
+        attr |= OPEN_ATTR_TRUNC;
+    }
+    if (flags & __MLIBC_O_APPEND)
+    {
+        attr |= OPEN_ATTR_APPEND;
+    }
+    if (flags & __MLIBC_O_WRONLY)
+    {
+        m |= OPEN_MODE_WRITE;
+    }
+    if (flags & __MLIBC_O_RDONLY)
+    {
+        m |= OPEN_MODE_READ;
+    }
+    if (flags & __MLIBC_O_RDWR)
+    {
+        m |= OPEN_MODE_WRITE | OPEN_MODE_READ;
+    }
+
+    int f = _s_open(pathname, m, attr);
     if (f > 0)
     {
         *fd = f;
@@ -435,8 +470,9 @@ int sys_open_dir(const char *path, int *handle)
     if (fd > 0)
     {
         *handle = fd;
+        return 0;
     }
-    return 0;
+    return fd;
 }
 
 int sys_read_entries(int handle, void *buffer, size_t max_size, size_t *bytes_read)
@@ -490,5 +526,18 @@ int sys_unlinkat(int fd, const char *path, int flags)
     }
     return _s_unlink(fd, path, flags);
 }
+
+int sys_dup(int fd, int flags, int *newfd)
+{
+    auto nfd = _s_dup(fd);
+    if (nfd >= 0)
+    {
+        *newfd = nfd;
+        return 0;
+    }
+    return nfd;
+}
+
+int sys_dup2(int fd, int flags, int newfd) { return _s_dup2(fd, newfd); }
 
 } // namespace mlibc
