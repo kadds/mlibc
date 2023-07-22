@@ -448,7 +448,7 @@ int sys_clone(void *entry, void *user_arg, void *tcb, pid_t *pid_out)
 
 int sys_execve(const char *path, char *const argv[], char *const envp[]) { return _s_execve(path, argv, envp); }
 
-int sys_waitpid(pid_t pid, int *status, int flags, pid_t *ret_pid)
+int sys_waitpid(pid_t pid, int *status, int flags, struct rusage *ru, pid_t *ret_pid) 
 {
     int64_t ret;
     int64_t opid = pid;
@@ -538,5 +538,15 @@ int sys_dup(int fd, int flags, int *newfd)
 }
 
 int sys_dup2(int fd, int flags, int newfd) { return _s_dup2(fd, newfd); }
+
+int sys_kill(int pid, int sig) {
+    sigtarget_t target;
+    target.id = pid;
+    target.flags = 0;
+    if (_s_sigsend(&target, sig, nullptr) == 0) {
+        return 0;
+    }
+	return -1;
+}
 
 } // namespace mlibc
