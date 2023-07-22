@@ -1,0 +1,14 @@
+[host_machine]
+system = 'naos'
+cpu_family = 'x86_64'
+cpu = 'i686'
+endian = 'little'
+
+[binaries]
+c = '/usr/bin/x86_64-pc-linux-gnu-gcc' 
+cpp = '/usr/bin/x86_64-pc-linux-gnu-g++'
+ar = '/usr/bin/ar'
+strip = '/usr/bin/strip'
+
+[properties]
+needs_exe_wrapper = true

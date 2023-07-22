@@ -319,6 +319,13 @@ elif host_machine.system() == 'ethereal'
 elif host_machine.system() == 'demo'
 	subdir('sysdeps/demo')
 # ANCHOR_END: demo-sysdeps
+elif host_machine.system() == 'naos'
+	disable_linux_option = true
+	disable_crypt_option = true
+	disable_iconv_option = true
+	rtld_include_dirs += include_directories('sysdeps/naos/include')
+	libc_include_dirs += include_directories('sysdeps/naos/include')
+	subdir('sysdeps/naos')
 else
 	error('No sysdeps defined for OS: ' + host_machine.system())
 endif
