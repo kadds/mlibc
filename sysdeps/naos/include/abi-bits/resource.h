@@ -5,10 +5,13 @@
 extern "C" {
 #endif
 
-#include <bits/posix/timeval.h>
+#include <mlibc-config.h>
+#include <bits/timeval.h>
 
+#if defined(_DEFAULT_SOURCE) || __MLIBC_XOPEN
 #define RUSAGE_SELF 0
 #define RUSAGE_CHILDREN -1
+#endif
 
 #define RLIMIT_CPU 0
 #define RLIMIT_FSIZE 1
@@ -27,6 +30,7 @@ extern "C" {
 #define RLIMIT_RTPRIO 14
 #define RLIMIT_NLIMITS 16
 
+#if defined(_DEFAULT_SOURCE) || __MLIBC_XOPEN
 struct rusage {
 	struct timeval ru_utime;
 	struct timeval ru_stime;
@@ -45,6 +49,7 @@ struct rusage {
 	long ru_nvcsw;
 	long ru_nivcsw;
 };
+#endif
 
 #ifdef __cplusplus
 }

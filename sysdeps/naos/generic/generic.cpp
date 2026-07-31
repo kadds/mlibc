@@ -1,5 +1,3 @@
-#include "mlibc/posix-sysdeps.hpp"
-#include "sysdeps/linux/include/abi-bits/seek-whence.h"
 #include <abi-bits/seek-whence.h>
 #include <abi-bits/stat.h>
 #include <abi-bits/vm-flags.h>
@@ -12,8 +10,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <mlibc/all-sysdeps.hpp>
+#include <mlibc/allocator.hpp>
 #include <mlibc/debug.hpp>
 #include <mlibc/fsfd_target.hpp>
+#include <mlibc/tcb.hpp>
+#include <mlibc/threads.hpp>
 #include <string.h>
 
 #define SYS_CALL(index, ret, name, ...)                                                                                \
@@ -238,22 +239,29 @@ SYS_CALL(64, void, _s_close_msg_queue, int64_t key)
 #define MSGQUEUE_FLAGS_NOBLOCK 1
 #define MSGQUEUE_FLAGS_NOBLOCKOTHER 2
 
-namespace mlibc
-{
+struct NaosThreadContext {
+	void *entry;
+	void *user_arg;
+	void *tcb;
+};
 
-void sys_libc_log(const char *message) { _s_log(message); }
+extern "C" [[noreturn]] void __mlibc_naos_thread_entry(void *raw_context);
 
-[[noreturn]] void sys_libc_panic()
+namespace mlibc {
+
+void Sysdeps<LibcLog>::operator()(const char *message) { _s_log(message); }
+
+[[noreturn]] void Sysdeps<LibcPanic>::operator()()
 {
-    sys_libc_log("panic");
+	Sysdeps<LibcLog>::operator()("panic");
     while (true)
     {
         _s_exit(-1);
     }
 }
 
-[[noreturn]] void sys_exit(int status) { _s_exit(status); }
-int sys_clock_get(int clock, time_t *secs, long *nanos)
+[[noreturn]] void Sysdeps<Exit>::operator()(int status) { _s_exit(status); }
+int Sysdeps<ClockGet>::operator()(int clock, time_t *secs, long *nanos)
 {
     time_clock c;
     if (int ret = _s_clock(clock, &c); ret != 0)
@@ -265,10 +273,10 @@ int sys_clock_get(int clock, time_t *secs, long *nanos)
     return 0;
 }
 
-int sys_tcb_set(void *pointer) { return _s_tcb_set(pointer); }
+int Sysdeps<TcbSet>::operator()(void *pointer) { return _s_tcb_set(pointer); }
 
-[[gnu::weak]] int sys_futex_tid() { return 1; }
-int sys_futex_wait(int *pointer, int expected, const struct timespec *time)
+pid_t Sysdeps<FutexTid>::operator()() { return 1; }
+int Sysdeps<FutexWait>::operator()(int *pointer, int expected, const struct timespec *time)
 {
     time_clock c;
     if (time != nullptr)
@@ -282,9 +290,13 @@ int sys_futex_wait(int *pointer, int expected, const struct timespec *time)
         return _s_futex(pointer, FUTEX_WAIT, expected, nullptr);
     }
 }
-int sys_futex_wake(int *pointer) { return _s_futex(pointer, FUTEX_WAKE, 0, nullptr); }
+int Sysdeps<FutexWake>::operator()(int *pointer, bool all)
+{
+	(void)all;
+	return _s_futex(pointer, FUTEX_WAKE, 0, nullptr);
+}
 
-int sys_anon_allocate(size_t size, void **pointer)
+int Sysdeps<AnonAllocate>::operator()(size_t size, void **pointer)
 {
     auto p = _s_mmap(0, 0, 0, size, MMAP_READ | MMAP_WRITE);
     if (p == nullptr)
@@ -295,9 +307,9 @@ int sys_anon_allocate(size_t size, void **pointer)
     return 0;
 }
 
-int sys_anon_free(void *pointer, size_t size) { return _s_mumap(pointer, size); }
+int Sysdeps<AnonFree>::operator()(void *pointer, size_t size) { return _s_mumap(pointer, size); }
 
-int sys_open(const char *pathname, int flags, mode_t mode, int *fd)
+int Sysdeps<Open>::operator()(const char *pathname, int flags, mode_t mode, int *fd)
 {
     uint64_t attr = OPEN_ATTR_FILE;
     uint64_t m = 0;
@@ -335,7 +347,7 @@ int sys_open(const char *pathname, int flags, mode_t mode, int *fd)
     return f;
 }
 
-int sys_read(int fd, void *buf, size_t count, ssize_t *bytes_read)
+int Sysdeps<Read>::operator()(int fd, void *buf, size_t count, ssize_t *bytes_read)
 {
     int64_t ret = _s_read(fd, buf, count, 0);
     if (ret >= 0)
@@ -346,7 +358,7 @@ int sys_read(int fd, void *buf, size_t count, ssize_t *bytes_read)
     return ret;
 }
 
-int sys_write(int fd, const void *buf, size_t count, ssize_t *bytes_written)
+int Sysdeps<Write>::operator()(int fd, const void *buf, size_t count, ssize_t *bytes_written)
 {
     int64_t ret = _s_write(fd, buf, count, 0);
     if (ret >= 0)
@@ -357,7 +369,7 @@ int sys_write(int fd, const void *buf, size_t count, ssize_t *bytes_written)
     return ret;
 }
 
-int sys_seek(int fd, off_t offset, int whence, off_t *new_offset)
+int Sysdeps<Seek>::operator()(int fd, off_t offset, int whence, off_t *new_offset)
 {
     int64_t ret = _s_lseek(fd, offset, whence);
     if (ret >= 0)
@@ -368,7 +380,7 @@ int sys_seek(int fd, off_t offset, int whence, off_t *new_offset)
     return ret;
 }
 
-int sys_pread(int fd, void *buf, size_t n, off_t off, ssize_t *bytes_read)
+int Sysdeps<Pread>::operator()(int fd, void *buf, size_t n, off_t off, ssize_t *bytes_read)
 {
     int64_t ret = _s_pread(off, fd, (char *)buf, n, 0);
     if (ret >= 0)
@@ -379,7 +391,7 @@ int sys_pread(int fd, void *buf, size_t n, off_t off, ssize_t *bytes_read)
     return ret;
 }
 
-int sys_pwrite(int fd, const void *buf, size_t n, off_t off, ssize_t *bytes_written)
+int Sysdeps<Pwrite>::operator()(int fd, const void *buf, size_t n, off_t off, ssize_t *bytes_written)
 {
     int64_t ret = _s_pwrite(off, fd, (const char *)buf, n, 0);
     if (ret >= 0)
@@ -390,13 +402,12 @@ int sys_pwrite(int fd, const void *buf, size_t n, off_t off, ssize_t *bytes_writ
     return ret;
 }
 
-int sys_close(int fd) { return _s_close(fd); }
+int Sysdeps<Close>::operator()(int fd) { return _s_close(fd); }
 
-int sys_isatty(int fd) { return _s_istty(fd); }
+int Sysdeps<Isatty>::operator()(int fd) { return _s_istty(fd); }
 
-[[gnu::weak]] int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat *statbuf);
 // mlibc assumes that anonymous memory returned by sys_vm_map() is zeroed by the kernel / whatever is behind the sysdeps
-int sys_vm_map(void *hint, size_t size, int prot, int flags, int fd, off_t offset, void **window)
+int Sysdeps<VmMap>::operator()(void *hint, size_t size, int prot, int flags, int fd, off_t offset, void **window)
 {
     auto p = _s_mmap((uint64_t)hint, fd, offset, size, flags);
     if (p == nullptr)
@@ -406,11 +417,11 @@ int sys_vm_map(void *hint, size_t size, int prot, int flags, int fd, off_t offse
     *window = p;
     return 0;
 }
-int sys_vm_unmap(void *pointer, size_t size) { return _s_mumap(pointer, size); }
+int Sysdeps<VmUnmap>::operator()(void *pointer, size_t size) { return _s_mumap(pointer, size); }
 
-void sys_yield() { _s_yield(); }
+void Sysdeps<Yield>::operator()() { _s_yield(); }
 
-int sys_sleep(time_t *secs, long *nanos)
+int Sysdeps<Sleep>::operator()(time_t *secs, long *nanos)
 {
     time_clock c;
     memset(&c, 0, sizeof(c));
@@ -425,7 +436,7 @@ int sys_sleep(time_t *secs, long *nanos)
     return _s_sleep(&c);
 }
 
-int sys_fork(pid_t *child)
+int Sysdeps<Fork>::operator()(pid_t *child)
 {
     int ret = _s_fork();
     *child = ret;
@@ -436,19 +447,54 @@ int sys_fork(pid_t *child)
     return 0;
 }
 
-int sys_clone(void *entry, void *user_arg, void *tcb, pid_t *pid_out)
+int Sysdeps<PrepareStack>::operator()(
+	void **stack,
+	void *entry,
+	void *user_arg,
+	void *tcb,
+	size_t *stack_size,
+	size_t *guard_size,
+	void **stack_base
+)
 {
-    int ret = _s_clone(entry, user_arg, tcb);
-    if (ret == 0)
-    {
-        *pid_out = _s_current_tid();
-    };
-    return ret;
+	(void)stack_size;
+	(void)guard_size;
+
+	auto context = static_cast<NaosThreadContext *>(
+		getAllocator().allocate(sizeof(NaosThreadContext))
+	);
+	if (!context)
+		return ENOMEM;
+
+	context->entry = entry;
+	context->user_arg = user_arg;
+	context->tcb = tcb;
+	*stack = context;
+	*stack_base = nullptr;
+	*stack_size = 0;
+	*guard_size = 0;
+	return 0;
 }
 
-int sys_execve(const char *path, char *const argv[], char *const envp[]) { return _s_execve(path, argv, envp); }
+[[noreturn]] void Sysdeps<ThreadExit>::operator()()
+{
+	_s_exit_thread(0);
+	__builtin_unreachable();
+}
 
-int sys_waitpid(pid_t pid, int *status, int flags, struct rusage *ru, pid_t *ret_pid) 
+int Sysdeps<Clone>::operator()(void *tcb, pid_t *pid_out, void *stack)
+{
+	int ret = _s_clone(reinterpret_cast<void *>(__mlibc_naos_thread_entry), stack, tcb);
+	if (ret < 0)
+		return -ret;
+
+	*pid_out = ret;
+	return 0;
+}
+
+int Sysdeps<Execve>::operator()(const char *path, char *const argv[], char *const envp[]) { return _s_execve(path, argv, envp); }
+
+int Sysdeps<Waitpid>::operator()(pid_t pid, int *status, int flags, struct rusage *ru, pid_t *ret_pid)
 {
     int64_t ret;
     int64_t opid = pid;
@@ -457,13 +503,13 @@ int sys_waitpid(pid_t pid, int *status, int flags, struct rusage *ru, pid_t *ret
     return r;
 }
 
-int sys_access(const char *path, int mode) { return _s_access(path, mode); }
+int Sysdeps<Access>::operator()(const char *path, int mode) { return _s_access(path, mode); }
 
-int sys_getcwd(char *buffer, size_t size) { return _s_current_dir(buffer, size); }
+int Sysdeps<GetCwd>::operator()(char *buffer, size_t size) { return _s_current_dir(buffer, size); }
 
-int sys_chdir(const char *path) { return _s_chdir(path); }
+int Sysdeps<Chdir>::operator()(const char *path) { return _s_chdir(path); }
 
-int sys_open_dir(const char *path, int *handle)
+int Sysdeps<OpenDir>::operator()(const char *path, int *handle)
 {
     int fd = _s_open_dir(path);
     if (fd > 0)
@@ -474,7 +520,7 @@ int sys_open_dir(const char *path, int *handle)
     return fd;
 }
 
-int sys_read_entries(int handle, void *buffer, size_t max_size, size_t *bytes_read)
+int Sysdeps<ReadEntries>::operator()(int handle, void *buffer, size_t max_size, size_t *bytes_read)
 {
     constexpr uint64_t buf_size = 2048;
     // dirent *dirent = reinterpret_cast<dirent *>(buffer);
@@ -513,11 +559,11 @@ int sys_read_entries(int handle, void *buffer, size_t max_size, size_t *bytes_re
     return ret;
 }
 
-int sys_rmdir(const char *path) { return _s_rmdir(path); }
+int Sysdeps<Rmdir>::operator()(const char *path) { return _s_rmdir(path); }
 
-int sys_mkdir(const char *path, mode_t mode) { return _s_mkdir(path, mode); }
+int Sysdeps<Mkdir>::operator()(const char *path, mode_t mode) { return _s_mkdir(path, mode); }
 
-int sys_unlinkat(int fd, const char *path, int flags)
+int Sysdeps<Unlinkat>::operator()(int fd, const char *path, int flags)
 {
     if (fd == AT_FDCWD)
     {
@@ -526,7 +572,7 @@ int sys_unlinkat(int fd, const char *path, int flags)
     return _s_unlink(fd, path, flags);
 }
 
-int sys_dup(int fd, int flags, int *newfd)
+int Sysdeps<Dup>::operator()(int fd, int flags, int *newfd)
 {
     auto nfd = _s_dup(fd);
     if (nfd >= 0)
@@ -537,9 +583,9 @@ int sys_dup(int fd, int flags, int *newfd)
     return nfd;
 }
 
-int sys_dup2(int fd, int flags, int newfd) { return _s_dup2(fd, newfd); }
+int Sysdeps<Dup2>::operator()(int fd, int flags, int newfd) { return _s_dup2(fd, newfd); }
 
-int sys_kill(int pid, int sig) {
+int Sysdeps<Kill>::operator()(int pid, int sig) {
     sigtarget_t target;
     target.id = pid;
     target.flags = 0;
@@ -549,4 +595,23 @@ int sys_kill(int pid, int sig) {
 	return -1;
 }
 
+pid_t Sysdeps<GetPid>::operator()() { return _s_current_pid(); }
+
 } // namespace mlibc
+
+extern "C" [[noreturn]] void __mlibc_naos_thread_entry(void *raw_context)
+{
+	auto context = static_cast<NaosThreadContext *>(raw_context);
+	auto entry = context->entry;
+	auto user_arg = context->user_arg;
+	auto tcb = static_cast<Tcb *>(context->tcb);
+	getAllocator().deallocate(context, sizeof(NaosThreadContext));
+
+	mlibc::sysdep<::TcbSet>(tcb);
+	while (!__atomic_load_n(&tcb->tid, __ATOMIC_RELAXED))
+		mlibc::sysdep<::FutexWait>(&tcb->tid, 0, nullptr);
+
+	__atomic_fetch_or(&tcb->cancelBits, 1, __ATOMIC_RELAXED);
+	tcb->invokeThreadFunc(entry, user_arg);
+	mlibc::thread_exit(tcb->returnValue);
+}

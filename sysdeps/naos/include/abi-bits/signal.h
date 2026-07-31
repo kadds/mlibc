@@ -5,12 +5,10 @@
 #include <time.h>
 #include <abi-bits/pid_t.h>
 #include <abi-bits/uid_t.h>
+#include <abi-bits/sigevent.h>
+#include <abi-bits/sigset_t.h>
+#include <abi-bits/sigval.h>
 #include <bits/size_t.h>
-
-union sigval {
-	int sival_int;
-	void *sival_ptr;
-};
 
 // struct taken from musl.
 
@@ -113,9 +111,6 @@ typedef void (*__sighandler) (int);
 #define SIGRTMIN 35
 #define SIGRTMAX 64
 
-// TODO: replace this by uint64_t
-typedef long sigset_t;
-
 // constants for sigprocmask()
 #define SIG_BLOCK 0
 #define SIG_UNBLOCK 1
@@ -158,11 +153,6 @@ typedef struct __stack {
 	int ss_flags;
 	size_t ss_size;
 } stack_t;
-
-// constants for sigev_notify of struct sigevent
-#define SIGEV_SIGNAL 0
-#define SIGEV_NONE 1
-#define SIGEV_THREAD 2
 
 #define SEGV_MAPERR 1
 #define SEGV_ACCERR 2
@@ -219,14 +209,6 @@ typedef struct __stack {
 #define REG_OLDMASK 21
 #define REG_CR2 22
 #define NGREG 23
-
-struct sigevent {
-	union sigval sigev_value;
-	int sigev_notify;
-	int sigev_signo;
-	void (*sigev_notify_function)(union sigval);
-	// MISSING: sigev_notify_attributes
-};
 
 struct sigaction {
 	union {
