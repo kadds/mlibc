@@ -309,9 +309,10 @@ int Sysdeps<FutexWake>::operator()(int *pointer, bool all)
 int Sysdeps<AnonAllocate>::operator()(size_t size, void **pointer)
 {
     auto p = _s_mmap(0, 0, 0, size, MMAP_READ | MMAP_WRITE);
-    if (p == nullptr)
+    const auto result = reinterpret_cast<intptr_t>(p);
+    if (result <= 0)
     {
-        return -1;
+        return result < 0 ? static_cast<int>(-result) : ENOMEM;
     }
     *pointer = p;
     return 0;
@@ -419,10 +420,33 @@ int Sysdeps<Isatty>::operator()(int fd) { return _s_istty(fd); }
 // mlibc assumes that anonymous memory returned by sys_vm_map() is zeroed by the kernel / whatever is behind the sysdeps
 int Sysdeps<VmMap>::operator()(void *hint, size_t size, int prot, int flags, int fd, off_t offset, void **window)
 {
-    auto p = _s_mmap((uint64_t)hint, fd, offset, size, flags);
-    if (p == nullptr)
+    uint64_t mmap_flags = 0;
+    if (prot & PROT_READ)
     {
-        return -1;
+        mmap_flags |= MMAP_READ;
+    }
+    if (prot & PROT_WRITE)
+    {
+        mmap_flags |= MMAP_WRITE;
+    }
+    if (prot & PROT_EXEC)
+    {
+        mmap_flags |= MMAP_EXEC;
+    }
+    if (!(flags & MAP_ANONYMOUS))
+    {
+        mmap_flags |= MMAP_FILE;
+    }
+    if (flags & MAP_SHARED)
+    {
+        mmap_flags |= MMAP_SHARED;
+    }
+
+    auto p = _s_mmap((uint64_t)hint, fd, offset, size, mmap_flags);
+    const auto result = reinterpret_cast<intptr_t>(p);
+    if (result <= 0)
+    {
+        return result < 0 ? static_cast<int>(-result) : ENOMEM;
     }
     *window = p;
     return 0;
