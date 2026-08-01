@@ -91,6 +91,9 @@ typedef unsigned int tcflag_t;
 #define HUPCL 0002000
 #define CLOCAL 0004000
 
+// mask for the baud rate bits in c_cflag
+#define CBAUD 0010017
+
 // bitwise constants for c_lflag in struct termios
 #define ECHO 0000010
 #define ECHOE 0000020

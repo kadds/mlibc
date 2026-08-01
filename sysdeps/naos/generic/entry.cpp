@@ -6,6 +6,10 @@
 // defined by the POSIX library
 void __mlibc_initLocale();
 
+// NaOS uses the statically initialized C locale. Keep the legacy startup hook
+// for the generic mlibc entry path, but there is nothing to initialize here.
+void __mlibc_initLocale() { }
+
 extern "C" uintptr_t *__dlapi_entrystack();
 extern "C" void __dlapi_enter(uintptr_t *);
 

@@ -15,6 +15,7 @@
 #include <mlibc/fsfd_target.hpp>
 #include <mlibc/tcb.hpp>
 #include <mlibc/threads.hpp>
+#include <signal.h>
 #include <string.h>
 
 #define SYS_CALL(index, ret, name, ...)                                                                                \
@@ -54,6 +55,15 @@ SYS_CALL(2, int, _s_clock, int clock_index, time_clock *clock);
 #define STDERR 2
 typedef int fd_t;
 
+namespace {
+
+// NaOS does not yet have a user-space signal trampoline. Keep the registered
+// actions so libc callers can query and restore them, while the kernel still
+// applies its default signal behavior.
+struct sigaction naos_signal_actions[NSIG] = {};
+
+} // namespace
+
 #define OPEN_ATTR_AUTO_CREATE_FILE 1
 #define OPEN_ATTR_TRUNC 256
 #define OPEN_ATTR_APPEND 2048
@@ -74,7 +84,7 @@ SYS_CALL(9, int, _s_close, fd_t fd);
 SYS_CALL(10, int, _s_dup, fd_t fd);
 SYS_CALL(11, int, _s_dup2, fd_t fd, fd_t newfd);
 SYS_CALL(12, int, _s_istty, fd_t fd);
-SYS_CALL(13, int, _s_stat, fd_t fd);
+SYS_CALL(13, int, _s_stat, int target, fd_t fd, const char *path, int flags, struct stat *statbuf);
 SYS_CALL(14, int64_t, _s_fcntl, fd_t fd, unsigned int operator_type, unsigned int target, unsigned int attr,
          void *value, uint64_t size)
 
@@ -572,6 +582,11 @@ int Sysdeps<Unlinkat>::operator()(int fd, const char *path, int flags)
     return _s_unlink(fd, path, flags);
 }
 
+int Sysdeps<Stat>::operator()(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat *statbuf)
+{
+    return _s_stat(static_cast<int>(fsfdt), fd, path, flags, statbuf);
+}
+
 int Sysdeps<Dup>::operator()(int fd, int flags, int *newfd)
 {
     auto nfd = _s_dup(fd);
@@ -584,6 +599,37 @@ int Sysdeps<Dup>::operator()(int fd, int flags, int *newfd)
 }
 
 int Sysdeps<Dup2>::operator()(int fd, int flags, int newfd) { return _s_dup2(fd, newfd); }
+
+int Sysdeps<Sigprocmask>::operator()(int how, const sigset_t *set, sigset_t *retrieve)
+{
+    uint64_t valid = 0;
+    uint64_t block = set ? static_cast<uint64_t>(*set) : 0;
+    uint64_t ignore = 0;
+    int ret = _s_sigmask(how, &valid, &block, &ignore);
+    if (ret == 0 && retrieve)
+        *retrieve = static_cast<sigset_t>(block);
+    return ret;
+}
+
+int Sysdeps<Sigaction>::operator()(int signum, const struct sigaction *act, struct sigaction *oldact)
+{
+    if (signum <= 0 || signum >= NSIG || signum == SIGKILL || signum == SIGSTOP)
+        return EINVAL;
+
+    if (oldact)
+        *oldact = naos_signal_actions[signum];
+    if (act)
+        naos_signal_actions[signum] = *act;
+    return 0;
+}
+
+// NaOS currently has one uid/gid namespace and starts every user process as
+// root. Keep these sysdeps explicit so mlibc does not abort in get*id().
+uid_t Sysdeps<GetUid>::operator()() { return 0; }
+uid_t Sysdeps<GetEuid>::operator()() { return 0; }
+gid_t Sysdeps<GetGid>::operator()() { return 0; }
+gid_t Sysdeps<GetEgid>::operator()() { return 0; }
+pid_t Sysdeps<GetPpid>::operator()() { return 0; }
 
 int Sysdeps<Kill>::operator()(int pid, int sig) {
     sigtarget_t target;
