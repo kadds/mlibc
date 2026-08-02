@@ -1,3 +1,4 @@
+#include <abi-bits/ioctls.h>
 #include <abi-bits/seek-whence.h>
 #include <abi-bits/stat.h>
 #include <abi-bits/vm-flags.h>
@@ -15,8 +16,11 @@
 #include <mlibc/fsfd_target.hpp>
 #include <mlibc/tcb.hpp>
 #include <mlibc/threads.hpp>
+#include <poll.h>
 #include <signal.h>
+#include <stdio.h>
 #include <string.h>
+#include <termios.h>
 
 #define SYS_CALL(index, ret, name, ...)                                                                                \
     extern "C" ret name(__VA_ARGS__);                                                                                  \
@@ -57,12 +61,37 @@ typedef int fd_t;
 
 namespace {
 
+// Kernel syscalls return negative POSIX errno values. Convert them to the
+// positive errno values expected by libc. -1 remains the legacy EOF/internal
+// sentinel used by a few older kernel paths.
+int naos_syscall_error(int64_t status)
+{
+    if (status == -1)
+        return EIO;
+    return status < 0 ? static_cast<int>(-status) : static_cast<int>(status);
+}
+
 // NaOS does not yet have a user-space signal trampoline. Keep the registered
 // actions so libc callers can query and restore them, while the kernel still
 // applies its default signal behavior.
 struct sigaction naos_signal_actions[NSIG] = {};
 
 } // namespace
+
+static_assert(sizeof(struct termios) == 60, "NaOS termios ABI must match x86-64 Linux layout");
+static_assert(offsetof(struct termios, c_iflag) == 0);
+static_assert(offsetof(struct termios, c_oflag) == 4);
+static_assert(offsetof(struct termios, c_cflag) == 8);
+static_assert(offsetof(struct termios, c_lflag) == 12);
+static_assert(offsetof(struct termios, c_line) == 16);
+static_assert(offsetof(struct termios, c_cc) == 17);
+static_assert(offsetof(struct termios, c_ibaud) == 52);
+static_assert(offsetof(struct termios, c_obaud) == 56);
+static_assert(sizeof(struct winsize) == 8, "NaOS winsize ABI must contain four 16-bit fields");
+static_assert(offsetof(struct winsize, ws_row) == 0);
+static_assert(offsetof(struct winsize, ws_col) == 2);
+static_assert(offsetof(struct winsize, ws_xpixel) == 4);
+static_assert(offsetof(struct winsize, ws_ypixel) == 6);
 
 #define OPEN_ATTR_AUTO_CREATE_FILE 1
 #define OPEN_ATTR_TRUNC 256
@@ -91,6 +120,16 @@ SYS_CALL(14, int64_t, _s_fcntl, fd_t fd, unsigned int operator_type, unsigned in
 SYS_CALL(15, int, _s_fsync, fd_t fd);
 SYS_CALL(16, int, _s_ftruncate, fd_t fd);
 SYS_CALL(17, int, _s_fallocate, fd_t fd);
+
+// 67 is the existing NaOS ioctl syscall. The PTY-related syscall numbers
+// below are reserved for the kernel PTY implementation and must remain in
+// sync with its syscall table.
+SYS_CALL(67, int64_t, _s_ioctl, fd_t fd, uint64_t request, void *argument);
+SYS_CALL(68, int64_t, _s_poll, struct pollfd *fds, uint64_t count, int timeout);
+SYS_CALL(69, int64_t, _s_setsid);
+SYS_CALL(70, int64_t, _s_getpgid, int pid);
+SYS_CALL(71, int64_t, _s_setpgid, int pid, int pgid);
+SYS_CALL(72, int64_t, _s_getsid, int pid);
 
 #define LSEEK_MODE_CURRENT 0
 #define LSEEK_MODE_BEGIN 1
@@ -416,6 +455,135 @@ int Sysdeps<Pwrite>::operator()(int fd, const void *buf, size_t n, off_t off, ss
 int Sysdeps<Close>::operator()(int fd) { return _s_close(fd); }
 
 int Sysdeps<Isatty>::operator()(int fd) { return _s_istty(fd); }
+
+int Sysdeps<Ioctl>::operator()(int fd, unsigned long request, void *argument, int *result)
+{
+    const int64_t ret = _s_ioctl(fd, request, argument);
+    if (ret != 0)
+    {
+        return naos_syscall_error(ret);
+    }
+    if (result != nullptr)
+    {
+        *result = 0;
+    }
+    return 0;
+}
+
+int Sysdeps<Tcgetattr>::operator()(int fd, struct termios *attr)
+{
+    int result = 0;
+    return sysdep<Ioctl>(fd, TCGETS, attr, &result);
+}
+
+int Sysdeps<Tcsetattr>::operator()(int fd, int optional_action, const struct termios *attr)
+{
+    int request = 0;
+    switch (optional_action)
+    {
+        case TCSANOW:
+            request = TCSETS;
+            break;
+        case TCSADRAIN:
+            request = TCSETSW;
+            break;
+        case TCSAFLUSH:
+            request = TCSETSF;
+            break;
+        default:
+            return EINVAL;
+    }
+
+    int result = 0;
+    return sysdep<Ioctl>(fd, request, const_cast<struct termios *>(attr), &result);
+}
+
+int Sysdeps<Tcgetwinsize>::operator()(int fd, struct winsize *winsz)
+{
+    int result = 0;
+    return sysdep<Ioctl>(fd, TIOCGWINSZ, winsz, &result);
+}
+
+int Sysdeps<Tcsetwinsize>::operator()(int fd, const struct winsize *winsz)
+{
+    int result = 0;
+    return sysdep<Ioctl>(fd, TIOCSWINSZ, const_cast<struct winsize *>(winsz), &result);
+}
+
+int Sysdeps<Ptsname>::operator()(int fd, char *buffer, size_t length)
+{
+    int index = 0;
+    int result = 0;
+    if (int error = sysdep<Ioctl>(fd, TIOCGPTN, &index, &result); error != 0)
+    {
+        return error;
+    }
+
+    const int required = snprintf(buffer, length, "/dev/pts/%d", index);
+    if (required < 0 || static_cast<size_t>(required) >= length)
+    {
+        return ERANGE;
+    }
+    return 0;
+}
+
+int Sysdeps<Unlockpt>::operator()(int fd)
+{
+    int unlock = 0;
+    int result = 0;
+    return sysdep<Ioctl>(fd, TIOCSPTLCK, &unlock, &result);
+}
+
+int Sysdeps<SetSid>::operator()(pid_t *sid)
+{
+    const int64_t ret = _s_setsid();
+    if (ret < 0)
+    {
+        return naos_syscall_error(ret);
+    }
+    *sid = static_cast<pid_t>(ret);
+    return 0;
+}
+
+int Sysdeps<GetPgid>::operator()(pid_t pid, pid_t *pgid)
+{
+    const int64_t ret = _s_getpgid(pid);
+    if (ret < 0)
+    {
+        return naos_syscall_error(ret);
+    }
+    *pgid = static_cast<pid_t>(ret);
+    return 0;
+}
+
+int Sysdeps<SetPgid>::operator()(pid_t pid, pid_t pgid)
+{
+    const int64_t ret = _s_setpgid(pid, pgid);
+    return ret == 0 ? 0 : naos_syscall_error(ret);
+}
+
+int Sysdeps<GetSid>::operator()(pid_t pid, pid_t *sid)
+{
+    const int64_t ret = _s_getsid(pid);
+    if (ret < 0)
+    {
+        return naos_syscall_error(ret);
+    }
+    *sid = static_cast<pid_t>(ret);
+    return 0;
+}
+
+int Sysdeps<Poll>::operator()(struct pollfd *fds, nfds_t count, int timeout, int *num_events)
+{
+    const int64_t ret = _s_poll(fds, count, timeout);
+    if (ret < 0)
+    {
+        *num_events = 0;
+        return naos_syscall_error(ret);
+    }
+    *num_events = static_cast<int>(ret);
+    return 0;
+}
 
 // mlibc assumes that anonymous memory returned by sys_vm_map() is zeroed by the kernel / whatever is behind the sysdeps
 int Sysdeps<VmMap>::operator()(void *hint, size_t size, int prot, int flags, int fd, off_t offset, void **window)

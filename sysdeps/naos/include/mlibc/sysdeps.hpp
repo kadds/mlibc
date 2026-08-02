@@ -24,9 +24,12 @@ struct NaosSysdepTags :
 	GetEuid,
 	GetCwd,
 	GetGid,
+	GetPgid,
 	GetPid,
 	GetPpid,
+	GetSid,
 	GetUid,
+	Ioctl,
 	Isatty,
 	Kill,
 	LibcLog,
@@ -45,14 +48,23 @@ struct NaosSysdepTags :
 	Sleep,
 	PrepareStack,
 	Stat,
+	SetPgid,
+	SetSid,
 	TcbSet,
+	Tcgetattr,
+	Tcgetwinsize,
+	Tcsetattr,
+	Tcsetwinsize,
 	ThreadExit,
 	Unlinkat,
+	Unlockpt,
 	VmMap,
 	VmUnmap,
 	Waitpid,
 	Write,
-	Yield
+	Yield,
+	Poll,
+	Ptsname
 {};
 
 template<typename Tag>

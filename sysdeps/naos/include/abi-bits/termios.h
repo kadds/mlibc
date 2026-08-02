@@ -34,13 +34,17 @@ typedef unsigned int tcflag_t;
 #define INLCR 0000100
 #define INPCK 0000020
 #define ISTRIP 0000040
+#define IUCLC 0001000
 #define IXANY 0004000
 #define IXOFF 0010000
 #define IXON 0002000
+#define IMAXBEL 0020000
+#define IUTF8 0040000
 #define PARMRK 0000010
 
 // bitwise flags for c_oflag in struct termios
 #define OPOST 0000001
+#define OLCUC 0000002
 #define ONLCR 0000004
 #define OCRNL 0000010
 #define ONOCR 0000020
@@ -91,6 +95,10 @@ typedef unsigned int tcflag_t;
 #define HUPCL 0002000
 #define CLOCAL 0004000
 
+#define CBAUDEX 0010000
+#define CMSPAR 010000000000
+#define CRTSCTS 020000000000
+
 // mask for the baud rate bits in c_cflag
 #define CBAUD 0010017
 
@@ -104,7 +112,13 @@ typedef unsigned int tcflag_t;
 #define ISIG 0000001
 #define NOFLSH 0000200
 #define TOSTOP 0000400
+#define XCASE 0000004
+#define ECHOCTL 0001000
 #define ECHOPRT 0002000
+#define ECHOKE 0004000
+#define FLUSHO 0010000
+#define PENDIN 0040000
+#define EXTPROC 0200000
 
 struct termios {
 	tcflag_t c_iflag;
@@ -113,8 +127,8 @@ struct termios {
 	tcflag_t c_lflag;
 	cc_t c_line;
 	cc_t c_cc[NCCS];
-	speed_t ibaud;
-	speed_t obaud;
+	speed_t c_ibaud;
+	speed_t c_obaud;
 };
 
 #define NCC 8
