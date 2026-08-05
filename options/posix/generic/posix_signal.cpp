@@ -65,7 +65,7 @@ int kill(pid_t pid, int number) {
 }
 
 int killpg(pid_t pgrp, int sig) {
-	if(pgrp > 1) {
+	if(pgrp == 0 || pgrp > 1) {
 		return kill(-pgrp, sig);
 	}
 

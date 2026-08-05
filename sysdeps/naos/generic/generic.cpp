@@ -10,6 +10,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <mlibc/all-sysdeps.hpp>
 #include <mlibc/allocator.hpp>
 #include <mlibc/debug.hpp>
@@ -337,7 +338,7 @@ int encoded_native_call(
 		getAllocator().deallocate(wire, result_capacity);
 		return EINVAL;
 	}
-	const int error = native_call(target, method, wire, written, result);
+	const int error = native_call(target, method, written == 0 ? nullptr : wire, written, result);
 	getAllocator().deallocate(wire, result_capacity);
 	return error;
 }
@@ -844,8 +845,9 @@ int native_call(
 	na_handle_t invocation = NA_HANDLE_INVALID;
 	uint64_t status = client.submit(client.context, target, method, static_cast<const uint8_t *>(request), request_bytes,
 	                                nullptr, 0, 0, &invocation);
-	if (status != NA_STATUS_OK)
+	if (status != NA_STATUS_OK) {
 		return status_errno(status);
+	}
 
 	na_wait_item_t wait_item{invocation, NA_SIGNAL_COMPLETED | NA_SIGNAL_PEER_CLOSED, 0};
 	status = _na_handle_wait_many(&wait_item, 1, UINT64_MAX);
@@ -1350,14 +1352,14 @@ void Sysdeps<LibcLog>::operator()(const char *message) { _s_log(message); }
 int Sysdeps<ClockGet>::operator()(int clock, time_t *secs, long *nanos) {
 	time_clock c;
 	if (int ret = _s_clock(clock, &c); ret != 0) {
-		return ret;
+		return naos_syscall_error(ret);
 	}
 	*secs = c.tv_sec;
 	*nanos = c.tv_nsec;
 	return 0;
 }
 
-int Sysdeps<TcbSet>::operator()(void *pointer) { return _s_tcb_set(pointer); }
+int Sysdeps<TcbSet>::operator()(void *pointer) { return naos_syscall_error(_s_tcb_set(pointer)); }
 
 pid_t Sysdeps<FutexTid>::operator()() { return 1; }
 int Sysdeps<FutexWait>::operator()(int *pointer, int expected, const struct timespec *time) {
@@ -1365,14 +1367,13 @@ int Sysdeps<FutexWait>::operator()(int *pointer, int expected, const struct time
 	if (time != nullptr) {
 		c.tv_sec = time->tv_sec;
 		c.tv_nsec = time->tv_nsec;
-		return _s_futex(pointer, FUTEX_WAIT, expected, &c);
+		return naos_syscall_error(_s_futex(pointer, FUTEX_WAIT, expected, &c));
 	} else {
-		return _s_futex(pointer, FUTEX_WAIT, expected, nullptr);
+		return naos_syscall_error(_s_futex(pointer, FUTEX_WAIT, expected, nullptr));
 	}
 }
 int Sysdeps<FutexWake>::operator()(int *pointer, bool all) {
-	(void)all;
-	return _s_futex(pointer, FUTEX_WAKE, 0, nullptr);
+	return naos_syscall_error(_s_futex(pointer, FUTEX_WAKE, all ? INT_MAX : 1, nullptr));
 }
 
 int Sysdeps<AnonAllocate>::operator()(size_t size, void **pointer) {
@@ -1794,8 +1795,9 @@ int Sysdeps<Ioctl>::operator()(int fd, unsigned long request, void *argument, in
 		error = EINVAL;
 	}
 	_na_handle_close(control);
-	if (error != 0)
+	if (error != 0) {
 		return error;
+	}
 	if (copy_result) {
 		if (call.byte_count < (scalar_result ? sizeof(uint64_t) : result_size)) {
 			naos_native::destroy_result(call);
@@ -2189,14 +2191,14 @@ int Sysdeps<Sleep>::operator()(time_t *secs, long *nanos) {
 	if (nanos != nullptr) {
 		c.tv_nsec = *nanos;
 	}
-	return _s_sleep(&c);
+	return naos_syscall_error(_s_sleep(&c));
 }
 
 int Sysdeps<Fork>::operator()(pid_t *child) {
 	int ret = _s_fork();
 	*child = ret;
 	if (ret < 0) {
-		return ret;
+		return naos_syscall_error(ret);
 	}
 	if (ret == 0)
 		naos_native::reset_after_fork();
@@ -2238,7 +2240,7 @@ int Sysdeps<PrepareStack>::operator()(
 int Sysdeps<Clone>::operator()(void *tcb, pid_t *pid_out, void *stack) {
 	int ret = _s_clone(reinterpret_cast<void *>(__mlibc_naos_thread_entry), stack, tcb);
 	if (ret < 0)
-		return -ret;
+		return naos_syscall_error(ret);
 
 	*pid_out = ret;
 	return 0;
@@ -2837,18 +2839,40 @@ int Sysdeps<Sigprocmask>::operator()(int how, const sigset_t *set, sigset_t *ret
 	int ret = _s_sigmask(how, &valid, &block, &ignore);
 	if (ret == 0 && retrieve)
 		*retrieve = static_cast<sigset_t>(block);
-	return ret;
+	return naos_syscall_error(ret);
 }
 
 int
 Sysdeps<Sigaction>::operator()(int signum, const struct sigaction *act, struct sigaction *oldact) {
-	if (signum <= 0 || signum >= NSIG || signum == SIGKILL || signum == SIGSTOP)
+	if (signum <= 0 || signum >= NSIG || signum >= 64 || signum == SIGKILL || signum == SIGSTOP)
 		return EINVAL;
 
 	if (oldact)
 		*oldact = naos_signal_actions[signum];
-	if (act)
-		naos_signal_actions[signum] = *act;
+	if (!act)
+		return 0;
+
+	const uint64_t bit = 1ULL << signum;
+	sig_mask_t valid = 0;
+	sig_mask_t block = 0;
+	sig_mask_t ignore = 0;
+	if (int e = _s_sigmask(SIGOPT_GET, &valid, &block, &ignore); e != 0)
+		return naos_syscall_error(e);
+
+	if (act->sa_handler == SIG_DFL) {
+		valid &= ~bit;
+		ignore &= ~bit;
+	} else {
+		valid |= bit;
+		if (act->sa_handler == SIG_IGN)
+			ignore |= bit;
+		else
+			ignore &= ~bit;
+	}
+	if (int e = _s_sigmask(SIGOPT_SET, &valid, &block, &ignore); e != 0)
+		return naos_syscall_error(e);
+
+	naos_signal_actions[signum] = *act;
 	return 0;
 }
 
@@ -2861,13 +2885,21 @@ gid_t Sysdeps<GetEgid>::operator()() { return 0; }
 pid_t Sysdeps<GetPpid>::operator()() { return 0; }
 
 int Sysdeps<Kill>::operator()(int pid, int sig) {
-	sigtarget_t target;
-	target.id = pid;
-	target.flags = 0;
-	if (_s_sigsend(&target, sig, nullptr) == 0) {
-		return 0;
+	sigtarget_t target{};
+	if (pid > 0) {
+		target.id = pid;
+		target.flags = SIGTGT_PROC;
+	} else if (pid == 0) {
+		target.id = 0;
+		target.flags = SIGTGT_GROUP;
+	} else if (pid < -1) {
+		target.id = -static_cast<int64_t>(pid);
+		target.flags = SIGTGT_GROUP;
+	} else {
+		// Sending to every process is not implemented by the NaOS kernel.
+		return ENOTSUP;
 	}
-	return -1;
+	return naos_syscall_error(_s_sigsend(&target, sig, nullptr));
 }
 
 pid_t Sysdeps<GetPid>::operator()() { return _s_current_pid(); }
