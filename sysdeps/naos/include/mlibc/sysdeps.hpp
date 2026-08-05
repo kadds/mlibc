@@ -83,7 +83,8 @@ struct NaosSysdepTags :
 	Write,
 	Yield,
 	Poll,
-	Ptsname
+	Ptsname,
+	Pipe
 {};
 
 template<typename Tag>

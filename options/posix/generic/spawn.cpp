@@ -266,8 +266,11 @@ int posix_spawn(pid_t *__restrict res, const char *__restrict path,
 		const posix_spawn_file_actions_t *file_actions,
 		const posix_spawnattr_t *__restrict attrs,
 		char *const argv[], char *const envp[]) {
-	if (file_actions == nullptr && attrs == nullptr && naos_native_spawn != nullptr)
-		return naos_native_spawn(res, path, argv, envp);
+	/*
+	 * Keep the POSIX entry point on the fork + exec path.  The native NaOS
+	 * spawn primitive currently bootstraps only the standard streams and does
+	 * not yet transfer every non-CLOEXEC descriptor or spawn attribute.
+	 */
 	return posix_spawn_impl(res, path, file_actions, attrs, argv, envp, execve);
 }
 

@@ -115,6 +115,7 @@ SYS_CALL(34, uint64_t, _na_bootstrap, na_bootstrap_frame_t *frame)
 SYS_CALL(38, int64_t, _na_process_exec, const na_process_exec_frame_t *frame)
 SYS_CALL(39, int64_t, _na_process_handle_open, int64_t pid, na_handle_t *result)
 SYS_CALL(40, int64_t, _na_process_spawn, const na_process_spawn_frame_t *frame)
+SYS_CALL(41, int64_t, _na_pipe_create, na_pipe_create_frame_t *frame)
 SYS_CALL(35, uint64_t, _na_tty_control_acquire, na_handle_t stream, na_handle_t *result)
 SYS_CALL(36, uint64_t, _na_memory_map, na_memory_map_frame_t *frame)
 SYS_CALL(37, uint64_t, _na_memory_unmap, na_memory_unmap_frame_t *frame)
@@ -1399,6 +1400,37 @@ int Sysdeps<AnonFree>::operator()(void *pointer, size_t size) {
 
 int Sysdeps<Open>::operator()(const char *pathname, int flags, mode_t mode, int *fd) {
 	return naos_native::open_path(pathname, flags, mode, fd);
+}
+
+int Sysdeps<Pipe>::operator()(int *fds, int flags) {
+	if (fds == nullptr)
+		return EFAULT;
+	if ((flags & ~(O_CLOEXEC | O_NONBLOCK)) != 0)
+		return EINVAL;
+
+	na_pipe_create_frame_t frame{};
+	const int error = naos_syscall_error(_na_pipe_create(&frame));
+	if (error != 0)
+		return error;
+
+	const int status_flags = flags & O_NONBLOCK;
+	const int descriptor_flags = (flags & O_CLOEXEC) != 0 ? FD_CLOEXEC : 0;
+	const int read_fd = naos_native::allocate_fd(frame.read_end, O_RDONLY | status_flags, descriptor_flags);
+	if (read_fd < 0) {
+		_na_handle_close(frame.read_end);
+		_na_handle_close(frame.write_end);
+		return EMFILE;
+	}
+	const int write_fd = naos_native::allocate_fd(frame.write_end, O_WRONLY | status_flags, descriptor_flags);
+	if (write_fd < 0) {
+		naos_native::close_fd(read_fd);
+		_na_handle_close(frame.write_end);
+		return EMFILE;
+	}
+
+	fds[0] = read_fd;
+	fds[1] = write_fd;
+	return 0;
 }
 
 int Sysdeps<Read>::operator()(int fd, void *buf, size_t count, ssize_t *bytes_read) {
