@@ -13,6 +13,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+extern "C" int naos_native_spawn(pid_t *__restrict pid, const char *__restrict path,
+		char *const argv[], char *const envp[]) __attribute__((weak));
+
 /*
  * Musl places this in a seperate header called fdop.h
  * This header isn't present in glibc, or on my host, so I
@@ -263,6 +266,8 @@ int posix_spawn(pid_t *__restrict res, const char *__restrict path,
 		const posix_spawn_file_actions_t *file_actions,
 		const posix_spawnattr_t *__restrict attrs,
 		char *const argv[], char *const envp[]) {
+	if (file_actions == nullptr && attrs == nullptr && naos_native_spawn != nullptr)
+		return naos_native_spawn(res, path, argv, envp);
 	return posix_spawn_impl(res, path, file_actions, attrs, argv, envp, execve);
 }
 

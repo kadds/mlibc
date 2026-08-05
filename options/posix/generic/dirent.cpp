@@ -48,6 +48,8 @@ DIR *fdopendir(int fd) {
 	__ensure(dir);
 	dir->__ent_next = 0;
 	dir->__ent_limit = 0;
+	memset(dir->__ent_buffer, 0, sizeof(dir->__ent_buffer));
+	dir->__seek_offset = 0;
 	dir->__seek_offset = 0;
 	int flags = fcntl(fd, F_GETFD);
 	fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
@@ -60,6 +62,8 @@ DIR *opendir(const char *path) {
 	__ensure(dir);
 	dir->__ent_next = 0;
 	dir->__ent_limit = 0;
+	memset(dir->__ent_buffer, 0, sizeof(dir->__ent_buffer));
+	dir->__seek_offset = 0;
 
 	if(int e = mlibc::sysdep_or_enosys<OpenDir>(path, &dir->__handle); e) {
 		errno = e;

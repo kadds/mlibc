@@ -15,6 +15,29 @@ endif
 
 fs = import('fs')
 
+naos_idl_compiler = find_program('python3')
+naos_idl_source_dir = meson.current_source_dir() / '../../idl/system'
+naos_generated_include_dir = meson.current_build_dir()
+naos_generated_dir = naos_generated_include_dir / 'naos/generated/system'
+naos_generated_index = naos_generated_include_dir / 'naos/generated/system_uapi.h'
+naos_idl_sources = [
+	naos_idl_source_dir / 'directory.naidl',
+	naos_idl_source_dir / 'file.naidl',
+	naos_idl_source_dir / 'memory_object.naidl',
+	naos_idl_source_dir / 'process.naidl',
+	naos_idl_source_dir / 'shared_ring.naidl',
+	naos_idl_source_dir / 'stream.naidl',
+	naos_idl_source_dir / 'tty_control.naidl',
+]
+naos_system_idl = custom_target('naos-system-idl',
+	output: 'system_uapi.h',
+	command: [naos_idl_compiler, meson.current_source_dir() / '../../../util/naoidl.py',
+		'generate-system', naos_idl_source_dir, naos_generated_dir, naos_generated_index, '@OUTPUT@'],
+	depend_files: naos_idl_sources + [meson.current_source_dir() / '../../../util/naoidl.py'],
+	build_by_default: true,
+)
+naos_generated_include_dirs = include_directories('.')
+
 rtld_include_dirs = [
 	include_directories('options/internal/include'),
 	include_directories('options/internal' / host_machine.cpu_family() + '-include'),
@@ -325,7 +348,15 @@ elif host_machine.system() == 'naos'
 	disable_iconv_option = true
 	rtld_include_dirs += include_directories('sysdeps/naos/include')
 	libc_include_dirs += include_directories('sysdeps/naos/include')
+	# The NaOS native object-call ABI is shared with the kernel. Keep one
+	# canonical wire definition instead of duplicating frame layouts in mlibc.
+	rtld_include_dirs += naos_generated_include_dirs
+	libc_include_dirs += naos_generated_include_dirs
+	rtld_include_dirs += include_directories('../../include')
+	libc_include_dirs += include_directories('../../include')
 	subdir('sysdeps/naos')
+	rtld_sources += naos_system_idl
+	libc_sources += naos_system_idl
 else
 	error('No sysdeps defined for OS: ' + host_machine.system())
 endif
