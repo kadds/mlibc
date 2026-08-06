@@ -837,14 +837,41 @@ naoidl::native_transport make_transport() {
 	return naoidl::native_transport(api);
 }
 
-int service_name(const char *name, std::uint32_t &size) {
-	if (name == nullptr)
+int service_uri(const char *uri, std::uint32_t &size) {
+	if (uri == nullptr)
 		return EFAULT;
-	const auto length = strlen(name);
+	const auto length = strlen(uri);
 	if (length == 0)
 		return EINVAL;
 	if (length > 255)
 		return ENAMETOOLONG;
+	constexpr char prefix[] = "naos://";
+	if (length <= sizeof(prefix) - 1 || memcmp(uri, prefix, sizeof(prefix) - 1) != 0)
+		return EINVAL;
+	bool segment_has_value = false;
+	bool segment_is_dot = true;
+	std::size_t segment_size = 0;
+	for (std::size_t i = sizeof(prefix) - 1; i < length; i++) {
+		const auto value = static_cast<unsigned char>(uri[i]);
+		if (value == '/') {
+			if (!segment_has_value || segment_is_dot || segment_size == 2)
+				return EINVAL;
+			segment_has_value = false;
+			segment_is_dot = true;
+			segment_size = 0;
+			continue;
+		}
+		const bool alpha = (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z');
+		const bool digit = value >= '0' && value <= '9';
+		if (!alpha && !digit && value != '-' && value != '_' && value != '.' && value != '~')
+			return EINVAL;
+		segment_has_value = true;
+		segment_size++;
+		if (segment_size > 2 || value != '.')
+			segment_is_dot = false;
+	}
+	if (!segment_has_value || segment_is_dot || segment_size == 2)
+		return EINVAL;
 	size = static_cast<std::uint32_t>(length);
 	return 0;
 }
@@ -854,12 +881,12 @@ int wait_service_invocation(na_handle_t invocation) {
 	return naos_syscall_error(_na_handle_wait_many(&wait_item, 1, UINT64_MAX));
 }
 
-extern "C" int naos_service_register_handle(const char *name, na_handle_t handle) {
+extern "C" int naos_service_register_handle(const char *uri, na_handle_t handle) {
 	const int bootstrap_error = ensure_bootstrap();
 	if (bootstrap_error != 0)
 		return bootstrap_error;
-	std::uint32_t name_size = 0;
-	int error = service_name(name, name_size);
+	std::uint32_t uri_size = 0;
+	int error = service_uri(uri, uri_size);
 	if (error != 0)
 		return error;
 	if (handle == NA_HANDLE_INVALID)
@@ -871,7 +898,7 @@ extern "C" int naos_service_register_handle(const char *name, na_handle_t handle
 		return ENOMEM;
 	naos::system::ServiceDirectory::register_request request{};
 	request.service.value = 0;
-	request.name = {reinterpret_cast<const std::uint8_t *>(name), name_size};
+	request.name = {reinterpret_cast<const std::uint8_t *>(uri), uri_size};
 	na_resource_disposition_t disposition{};
 	disposition.handle = handle;
 	disposition.operation = NA_RESOURCE_MOVE;
@@ -901,7 +928,7 @@ extern "C" int naos_service_register_handle(const char *name, na_handle_t handle
 	return result_errno(result);
 }
 
-extern "C" int naos_service_register_fd(const char *name, int fd) {
+extern "C" int naos_service_register_fd(const char *uri, int fd) {
 	const int bootstrap_error = ensure_bootstrap();
 	if (bootstrap_error != 0)
 		return bootstrap_error;
@@ -911,21 +938,21 @@ extern "C" int naos_service_register_fd(const char *name, int fd) {
 	na_handle_t duplicate = NA_HANDLE_INVALID;
 	if (_na_handle_duplicate(source, 0, &duplicate) != NA_STATUS_OK)
 		return EBADF;
-	const int error = naos_service_register_handle(name, duplicate);
+	const int error = naos_service_register_handle(uri, duplicate);
 	if (error != 0)
 		_na_handle_close(duplicate);
 	return error;
 }
 
-extern "C" int naos_service_resolve(const char *name, na_handle_t *handle) {
+extern "C" int naos_service_resolve(const char *uri, na_handle_t *handle) {
 	if (handle == nullptr)
 		return EFAULT;
 	*handle = NA_HANDLE_INVALID;
 	const int bootstrap_error = ensure_bootstrap();
 	if (bootstrap_error != 0)
 		return bootstrap_error;
-	std::uint32_t name_size = 0;
-	int error = service_name(name, name_size);
+	std::uint32_t uri_size = 0;
+	int error = service_uri(uri, uri_size);
 	if (error != 0)
 		return error;
 	const auto wire_capacity = static_cast<std::uint64_t>(NA_CHANNEL_MAX_MESSAGE_BYTES);
@@ -933,7 +960,7 @@ extern "C" int naos_service_resolve(const char *name, na_handle_t *handle) {
 	if (wire == nullptr)
 		return ENOMEM;
 	naos::system::ServiceDirectory::resolve_request request{};
-	request.name = {reinterpret_cast<const std::uint8_t *>(name), name_size};
+	request.name = {reinterpret_cast<const std::uint8_t *>(uri), uri_size};
 	na_handle_t invocation = NA_HANDLE_INVALID;
 	auto transport = make_transport();
 	auto client = naos::system::ServiceDirectory::ServiceDirectoryClient(transport.async(), service_directory);
@@ -972,12 +999,12 @@ extern "C" int naos_service_resolve(const char *name, na_handle_t *handle) {
 	return 0;
 }
 
-extern "C" int naos_service_unregister(const char *name) {
+extern "C" int naos_service_unregister(const char *uri) {
 	const int bootstrap_error = ensure_bootstrap();
 	if (bootstrap_error != 0)
 		return bootstrap_error;
-	std::uint32_t name_size = 0;
-	int error = service_name(name, name_size);
+	std::uint32_t uri_size = 0;
+	int error = service_uri(uri, uri_size);
 	if (error != 0)
 		return error;
 	const auto wire_capacity = static_cast<std::uint64_t>(NA_CHANNEL_MAX_MESSAGE_BYTES);
@@ -985,7 +1012,7 @@ extern "C" int naos_service_unregister(const char *name) {
 	if (wire == nullptr)
 		return ENOMEM;
 	naos::system::ServiceDirectory::unregister_request request{};
-	request.name = {reinterpret_cast<const std::uint8_t *>(name), name_size};
+	request.name = {reinterpret_cast<const std::uint8_t *>(uri), uri_size};
 	na_handle_t invocation = NA_HANDLE_INVALID;
 	auto transport = make_transport();
 	auto client = naos::system::ServiceDirectory::ServiceDirectoryClient(transport.async(), service_directory);
