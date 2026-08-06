@@ -854,7 +854,7 @@ int wait_service_invocation(na_handle_t invocation) {
 	return naos_syscall_error(_na_handle_wait_many(&wait_item, 1, UINT64_MAX));
 }
 
-extern "C" int naos_service_register_fd(const char *name, int fd) {
+extern "C" int naos_service_register_handle(const char *name, na_handle_t handle) {
 	const int bootstrap_error = ensure_bootstrap();
 	if (bootstrap_error != 0)
 		return bootstrap_error;
@@ -862,38 +862,30 @@ extern "C" int naos_service_register_fd(const char *name, int fd) {
 	int error = service_name(name, name_size);
 	if (error != 0)
 		return error;
-	const auto source = handle_for_fd(fd);
-	if (source == NA_HANDLE_INVALID)
-		return EBADF;
-	na_handle_t endpoint = NA_HANDLE_INVALID;
-	if (_na_handle_duplicate(source, 0, &endpoint) != NA_STATUS_OK)
+	if (handle == NA_HANDLE_INVALID)
 		return EBADF;
 
 	const auto wire_capacity = static_cast<std::uint64_t>(NA_CHANNEL_MAX_MESSAGE_BYTES);
 	auto *wire = static_cast<std::uint8_t *>(getAllocator().allocate(wire_capacity));
-	if (wire == nullptr) {
-		_na_handle_close(endpoint);
+	if (wire == nullptr)
 		return ENOMEM;
-	}
 	naos::system::ServiceDirectory::register_request request{};
 	request.service.value = 0;
 	request.name = {reinterpret_cast<const std::uint8_t *>(name), name_size};
 	na_resource_disposition_t disposition{};
-	disposition.handle = endpoint;
+	disposition.handle = handle;
 	disposition.operation = NA_RESOURCE_MOVE;
 	na_handle_t invocation = NA_HANDLE_INVALID;
 	auto transport = make_transport();
 	auto client = naos::system::ServiceDirectory::ServiceDirectoryClient(transport.async(), service_directory);
 	const auto submit_status = client.submit_register(request, &disposition, 1, &invocation, wire, wire_capacity);
 	if (submit_status != NA_STATUS_OK) {
-		_na_handle_close(endpoint);
 		getAllocator().deallocate(wire, wire_capacity);
 		return status_errno(submit_status);
 	}
 	error = wait_service_invocation(invocation);
 	if (error != 0) {
 		_na_handle_close(invocation);
-		_na_handle_close(endpoint);
 		getAllocator().deallocate(wire, wire_capacity);
 		return error;
 	}
@@ -904,13 +896,24 @@ extern "C" int naos_service_register_fd(const char *name, int fd) {
 	                                              NA_CHANNEL_MAX_RESOURCES, result);
 	_na_handle_close(invocation);
 	getAllocator().deallocate(wire, wire_capacity);
-	if (take_status != NA_STATUS_OK) {
-		_na_handle_close(endpoint);
+	if (take_status != NA_STATUS_OK)
 		return status_errno(take_status);
-	}
-	error = result_errno(result);
+	return result_errno(result);
+}
+
+extern "C" int naos_service_register_fd(const char *name, int fd) {
+	const int bootstrap_error = ensure_bootstrap();
+	if (bootstrap_error != 0)
+		return bootstrap_error;
+	const auto source = handle_for_fd(fd);
+	if (source == NA_HANDLE_INVALID)
+		return EBADF;
+	na_handle_t duplicate = NA_HANDLE_INVALID;
+	if (_na_handle_duplicate(source, 0, &duplicate) != NA_STATUS_OK)
+		return EBADF;
+	const int error = naos_service_register_handle(name, duplicate);
 	if (error != 0)
-		_na_handle_close(endpoint);
+		_na_handle_close(duplicate);
 	return error;
 }
 
