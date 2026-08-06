@@ -26,6 +26,7 @@ naos_idl_sources = [
 	naos_idl_source_dir / 'memory_object.naidl',
 	naos_idl_source_dir / 'process.naidl',
 	naos_idl_source_dir / 'shared_ring.naidl',
+	naos_idl_source_dir / 'service_directory.naidl',
 	naos_idl_source_dir / 'stream.naidl',
 	naos_idl_source_dir / 'tty_control.naidl',
 ]

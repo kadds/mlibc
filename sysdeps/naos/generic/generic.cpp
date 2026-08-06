@@ -22,6 +22,7 @@
 #include <naos/generated/system/Directory.hpp>
 #include <naos/generated/system/File.hpp>
 #include <naos/generated/system/Process.hpp>
+#include <naos/generated/system/ServiceDirectory_client.hpp>
 #include <naos/generated/system/Stream.hpp>
 #include <naos/generated/system/TtyControl.hpp>
 #include <naos/generated/system_uapi.h>
@@ -31,6 +32,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <termios.h>
+#include <naos/service_directory.hpp>
 
 #define SYS_CALL(index, ret, name, ...)                                                            \
 	extern "C" ret name(__VA_ARGS__);                                                              \
@@ -472,6 +474,11 @@ void reset_after_fork() {
 		return inspect(handle, info) && info.binding == NA_BINDING_KERNEL_VIEW
 		       && info.scope == NA_SCOPE_DIRECTORY;
 	};
+	auto is_service_directory = [&](na_handle_t handle) {
+		na_handle_info_t info{};
+		return inspect(handle, info) && info.binding == NA_BINDING_KERNEL_VIEW
+		       && info.scope == NA_SCOPE_SERVICE_DIRECTORY;
+	};
 	auto is_stream = [&](na_handle_t handle) {
 		na_handle_info_t info{};
 		return inspect(handle, info) && info.binding == NA_BINDING_KERNEL_VIEW
@@ -486,8 +493,8 @@ void reset_after_fork() {
 		}
 	}
 	const bool bootstrap_valid =
-	    is_directory(snapshot_root) && is_directory(snapshot_current)
-	    && is_directory(snapshot_service) && valid_fd_slots[STDIN] && valid_fd_slots[STDOUT]
+		is_directory(snapshot_root) && is_directory(snapshot_current)
+	    && is_service_directory(snapshot_service) && valid_fd_slots[STDIN] && valid_fd_slots[STDOUT]
 	    && valid_fd_slots[STDERR] && is_stream(snapshot[STDIN].handle)
 	    && is_stream(snapshot[STDOUT].handle) && is_stream(snapshot[STDERR].handle);
 
@@ -828,6 +835,182 @@ naoidl::native_transport make_transport() {
 		return static_cast<na_status_t>(_na_responder_fail(responder, frame));
 	};
 	return naoidl::native_transport(api);
+}
+
+int service_name(const char *name, std::uint32_t &size) {
+	if (name == nullptr)
+		return EFAULT;
+	const auto length = strlen(name);
+	if (length == 0)
+		return EINVAL;
+	if (length > 255)
+		return ENAMETOOLONG;
+	size = static_cast<std::uint32_t>(length);
+	return 0;
+}
+
+int wait_service_invocation(na_handle_t invocation) {
+	na_wait_item_t wait_item{invocation, NA_SIGNAL_COMPLETED | NA_SIGNAL_PEER_CLOSED, 0};
+	return naos_syscall_error(_na_handle_wait_many(&wait_item, 1, UINT64_MAX));
+}
+
+extern "C" int naos_service_register_fd(const char *name, int fd) {
+	const int bootstrap_error = ensure_bootstrap();
+	if (bootstrap_error != 0)
+		return bootstrap_error;
+	std::uint32_t name_size = 0;
+	int error = service_name(name, name_size);
+	if (error != 0)
+		return error;
+	const auto source = handle_for_fd(fd);
+	if (source == NA_HANDLE_INVALID)
+		return EBADF;
+	na_handle_t endpoint = NA_HANDLE_INVALID;
+	if (_na_handle_duplicate(source, 0, &endpoint) != NA_STATUS_OK)
+		return EBADF;
+
+	const auto wire_capacity = static_cast<std::uint64_t>(NA_CHANNEL_MAX_MESSAGE_BYTES);
+	auto *wire = static_cast<std::uint8_t *>(getAllocator().allocate(wire_capacity));
+	if (wire == nullptr) {
+		_na_handle_close(endpoint);
+		return ENOMEM;
+	}
+	naos::system::ServiceDirectory::register_request request{};
+	request.service.value = 0;
+	request.name = {reinterpret_cast<const std::uint8_t *>(name), name_size};
+	na_resource_disposition_t disposition{};
+	disposition.handle = endpoint;
+	disposition.operation = NA_RESOURCE_MOVE;
+	na_handle_t invocation = NA_HANDLE_INVALID;
+	auto transport = make_transport();
+	auto client = naos::system::ServiceDirectory::ServiceDirectoryClient(transport.async(), service_directory);
+	const auto submit_status = client.submit_register(request, &disposition, 1, &invocation, wire, wire_capacity);
+	if (submit_status != NA_STATUS_OK) {
+		_na_handle_close(endpoint);
+		getAllocator().deallocate(wire, wire_capacity);
+		return status_errno(submit_status);
+	}
+	error = wait_service_invocation(invocation);
+	if (error != 0) {
+		_na_handle_close(invocation);
+		_na_handle_close(endpoint);
+		getAllocator().deallocate(wire, wire_capacity);
+		return error;
+	}
+	naos::system::ServiceDirectory::register_response response{};
+	na_handle_t response_resources[NA_CHANNEL_MAX_RESOURCES] = {};
+	na_result_frame_t result{};
+	const auto take_status = client.take_register(invocation, response, wire, wire_capacity, response_resources,
+	                                              NA_CHANNEL_MAX_RESOURCES, result);
+	_na_handle_close(invocation);
+	getAllocator().deallocate(wire, wire_capacity);
+	if (take_status != NA_STATUS_OK) {
+		_na_handle_close(endpoint);
+		return status_errno(take_status);
+	}
+	error = result_errno(result);
+	if (error != 0)
+		_na_handle_close(endpoint);
+	return error;
+}
+
+extern "C" int naos_service_resolve(const char *name, na_handle_t *handle) {
+	if (handle == nullptr)
+		return EFAULT;
+	*handle = NA_HANDLE_INVALID;
+	const int bootstrap_error = ensure_bootstrap();
+	if (bootstrap_error != 0)
+		return bootstrap_error;
+	std::uint32_t name_size = 0;
+	int error = service_name(name, name_size);
+	if (error != 0)
+		return error;
+	const auto wire_capacity = static_cast<std::uint64_t>(NA_CHANNEL_MAX_MESSAGE_BYTES);
+	auto *wire = static_cast<std::uint8_t *>(getAllocator().allocate(wire_capacity));
+	if (wire == nullptr)
+		return ENOMEM;
+	naos::system::ServiceDirectory::resolve_request request{};
+	request.name = {reinterpret_cast<const std::uint8_t *>(name), name_size};
+	na_handle_t invocation = NA_HANDLE_INVALID;
+	auto transport = make_transport();
+	auto client = naos::system::ServiceDirectory::ServiceDirectoryClient(transport.async(), service_directory);
+	const auto submit_status = client.submit_resolve(request, nullptr, 0, &invocation, wire, wire_capacity);
+	if (submit_status != NA_STATUS_OK) {
+		getAllocator().deallocate(wire, wire_capacity);
+		return status_errno(submit_status);
+	}
+	error = wait_service_invocation(invocation);
+	if (error != 0) {
+		_na_handle_close(invocation);
+		getAllocator().deallocate(wire, wire_capacity);
+		return error;
+	}
+	naos::system::ServiceDirectory::resolve_response response{};
+	na_handle_t response_resources[NA_CHANNEL_MAX_RESOURCES] = {};
+	na_result_frame_t result{};
+	const auto take_status = client.take_resolve(invocation, response, wire, wire_capacity, response_resources,
+	                                              NA_CHANNEL_MAX_RESOURCES, result);
+	_na_handle_close(invocation);
+	getAllocator().deallocate(wire, wire_capacity);
+	if (take_status != NA_STATUS_OK)
+		return status_errno(take_status);
+	error = result_errno(result);
+	if (error != 0) {
+		for (std::uint64_t i = 0; i < result.actual_resources; i++)
+			_na_handle_close(response_resources[i]);
+		return error;
+	}
+	if (result.actual_resources != 1 || response.service.value != 0) {
+		for (std::uint64_t i = 0; i < result.actual_resources; i++)
+			_na_handle_close(response_resources[i]);
+		return EIO;
+	}
+	*handle = response_resources[0];
+	return 0;
+}
+
+extern "C" int naos_service_unregister(const char *name) {
+	const int bootstrap_error = ensure_bootstrap();
+	if (bootstrap_error != 0)
+		return bootstrap_error;
+	std::uint32_t name_size = 0;
+	int error = service_name(name, name_size);
+	if (error != 0)
+		return error;
+	const auto wire_capacity = static_cast<std::uint64_t>(NA_CHANNEL_MAX_MESSAGE_BYTES);
+	auto *wire = static_cast<std::uint8_t *>(getAllocator().allocate(wire_capacity));
+	if (wire == nullptr)
+		return ENOMEM;
+	naos::system::ServiceDirectory::unregister_request request{};
+	request.name = {reinterpret_cast<const std::uint8_t *>(name), name_size};
+	na_handle_t invocation = NA_HANDLE_INVALID;
+	auto transport = make_transport();
+	auto client = naos::system::ServiceDirectory::ServiceDirectoryClient(transport.async(), service_directory);
+	const auto submit_status = client.submit_unregister(request, nullptr, 0, &invocation, wire, wire_capacity);
+	if (submit_status != NA_STATUS_OK) {
+		getAllocator().deallocate(wire, wire_capacity);
+		return status_errno(submit_status);
+	}
+	error = wait_service_invocation(invocation);
+	if (error != 0) {
+		_na_handle_close(invocation);
+		getAllocator().deallocate(wire, wire_capacity);
+		return error;
+	}
+	naos::system::ServiceDirectory::unregister_response response{};
+	na_handle_t response_resources[NA_CHANNEL_MAX_RESOURCES] = {};
+	na_result_frame_t result{};
+	const auto take_status = client.take_unregister(invocation, response, wire, wire_capacity, response_resources,
+	                                                 NA_CHANNEL_MAX_RESOURCES, result);
+	_na_handle_close(invocation);
+	getAllocator().deallocate(wire, wire_capacity);
+	if (take_status != NA_STATUS_OK)
+		return status_errno(take_status);
+	return result_errno(result);
+}
+
+extern "C" int naos_handle_close(na_handle_t handle) {
+	return naos_syscall_error(_na_handle_close(handle));
 }
 
 int native_call(
