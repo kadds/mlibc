@@ -839,12 +839,13 @@ naoidl::native_transport make_transport() {
 }
 
 int service_uri(const char *uri, std::uint32_t &size) {
+	constexpr std::size_t max_service_uri_bytes = 65536;
 	if (uri == nullptr)
 		return EFAULT;
 	const auto length = strlen(uri);
 	if (length == 0)
 		return EINVAL;
-	if (length > 255)
+	if (length > max_service_uri_bytes)
 		return ENAMETOOLONG;
 	constexpr char prefix[] = "naos://";
 	if (length <= sizeof(prefix) - 1 || memcmp(uri, prefix, sizeof(prefix) - 1) != 0)
