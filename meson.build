@@ -16,7 +16,7 @@ endif
 fs = import('fs')
 
 naos_idl_compiler = find_program('python3')
-naos_idl_source_dir = meson.current_source_dir() / '../../idl/system'
+naos_idl_source_dir = meson.current_source_dir() / '../../../idl/system'
 naos_generated_include_dir = meson.current_build_dir()
 naos_generated_dir = naos_generated_include_dir / 'naos/generated/system'
 naos_generated_index = naos_generated_include_dir / 'naos/generated/system_uapi.h'
