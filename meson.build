@@ -20,6 +20,7 @@ naos_idl_source_dir = meson.current_source_dir() / '../../idl/system'
 naos_generated_include_dir = meson.current_build_dir()
 naos_generated_dir = naos_generated_include_dir / 'naos/generated/system'
 naos_generated_index = naos_generated_include_dir / 'naos/generated/system_uapi.h'
+naos_idl_template_dir = meson.current_source_dir() / '../../../util/templates/naoidl'
 naos_idl_sources = [
 	naos_idl_source_dir / 'directory.naidl',
 	naos_idl_source_dir / 'file.naidl',
@@ -30,11 +31,25 @@ naos_idl_sources = [
 	naos_idl_source_dir / 'stream.naidl',
 	naos_idl_source_dir / 'tty_control.naidl',
 ]
+naos_idl_templates = [
+	naos_idl_template_dir / 'client.hpp.htt',
+	naos_idl_template_dir / 'disposition_validator.hpp.htt',
+	naos_idl_template_dir / 'header.hpp.htt',
+	naos_idl_template_dir / 'index.h.htt',
+	naos_idl_template_dir / 'message.hpp.htt',
+	naos_idl_template_dir / 'resource_metadata_validator.hpp.htt',
+	naos_idl_template_dir / 'resource_validator.hpp.htt',
+	naos_idl_template_dir / 'runtime.hpp.htt',
+	naos_idl_template_dir / 'server.hpp.htt',
+	naos_idl_template_dir / 'struct.hpp.htt',
+	naos_idl_template_dir / 'type_codec.htt',
+	naos_idl_template_dir / 'uapi.h.htt',
+]
 naos_system_idl = custom_target('naos-system-idl',
 	output: 'system_uapi.h',
 	command: [naos_idl_compiler, meson.current_source_dir() / '../../../util/naoidl.py',
 		'generate-system', naos_idl_source_dir, naos_generated_dir, naos_generated_index, '@OUTPUT@'],
-	depend_files: naos_idl_sources + [meson.current_source_dir() / '../../../util/naoidl.py'],
+	depend_files: naos_idl_sources + naos_idl_templates + [meson.current_source_dir() / '../../../util/naoidl.py'],
 	build_by_default: true,
 )
 naos_generated_include_dirs = include_directories('.')

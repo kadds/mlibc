@@ -2,6 +2,7 @@
 #include <abi-bits/seek-whence.h>
 #include <abi-bits/stat.h>
 #include <abi-bits/vm-flags.h>
+#include <bits/ansi/timespec.h>
 #include <bits/ensure.h>
 #include <bits/off_t.h>
 #include <bits/ssize_t.h>
@@ -66,7 +67,7 @@ SYS_CALL(18, uint64_t, _na_channel_create, const na_channel_options_t *options, 
 SYS_CALL(19, uint64_t, _na_channel_send, na_handle_t endpoint, const na_channel_send_frame_t *frame)
 SYS_CALL(20, uint64_t, _na_channel_receive, na_handle_t endpoint, na_channel_receive_frame_t *frame)
 SYS_CALL(
-    22, uint64_t, _na_handle_wait_many, na_wait_item_t *items, uint64_t count, uint64_t deadline
+    22, uint64_t, _na_handle_wait_many, na_wait_item_t *items, uint64_t count, const struct timespec *deadline
 )
 SYS_CALL(
     23,
@@ -878,7 +879,7 @@ int service_uri(const char *uri, std::uint32_t &size) {
 
 int wait_service_invocation(na_handle_t invocation) {
 	na_wait_item_t wait_item{invocation, NA_SIGNAL_COMPLETED | NA_SIGNAL_PEER_CLOSED, 0};
-	return naos_syscall_error(_na_handle_wait_many(&wait_item, 1, UINT64_MAX));
+	return naos_syscall_error(_na_handle_wait_many(&wait_item, 1, nullptr));
 }
 
 extern "C" int naos_service_register_handle(const char *uri, na_handle_t handle) {
@@ -1064,7 +1065,7 @@ int native_call(
 	}
 
 	na_wait_item_t wait_item{invocation, NA_SIGNAL_COMPLETED | NA_SIGNAL_PEER_CLOSED, 0};
-	status = _na_handle_wait_many(&wait_item, 1, UINT64_MAX);
+	status = _na_handle_wait_many(&wait_item, 1, nullptr);
 	if (status != NA_STATUS_OK) {
 		_na_handle_close(invocation);
 		return status_errno(status);
@@ -2326,7 +2327,7 @@ int Sysdeps<Poll>::operator()(struct pollfd *fds, nfds_t count, int timeout, int
 	if (ready == 0 && timeout != 0) {
 		if (timeout < 0) {
 			if (wait_count != 0) {
-				const auto status = _na_handle_wait_many(wait_items, wait_count, UINT64_MAX);
+				const auto status = _na_handle_wait_many(wait_items, wait_count, nullptr);
 				if (status != NA_STATUS_OK && status != NA_STATUS_WAIT_TIMED_OUT)
 					return naos_native::status_errno(status);
 			} else {
