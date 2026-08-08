@@ -899,7 +899,7 @@ extern "C" int naos_service_register_handle(const char *uri, na_handle_t handle)
 		return ENOMEM;
 	naos::system::ServiceDirectory::register_request request{};
 	request.service.value = 0;
-	request.uri = {reinterpret_cast<const std::uint8_t *>(uri), uri_size};
+	request.uri = {uri, uri_size};
 	na_resource_disposition_t disposition{};
 	disposition.handle = handle;
 	disposition.operation = NA_RESOURCE_MOVE;
@@ -961,7 +961,7 @@ extern "C" int naos_service_resolve(const char *uri, na_handle_t *handle) {
 	if (wire == nullptr)
 		return ENOMEM;
 	naos::system::ServiceDirectory::resolve_request request{};
-	request.uri = {reinterpret_cast<const std::uint8_t *>(uri), uri_size};
+	request.uri = {uri, uri_size};
 	na_handle_t invocation = NA_HANDLE_INVALID;
 	auto transport = make_transport();
 	auto client = naos::system::ServiceDirectory::ServiceDirectoryClient(transport.async(), service_directory);
@@ -1013,7 +1013,7 @@ extern "C" int naos_service_unregister(const char *uri) {
 	if (wire == nullptr)
 		return ENOMEM;
 	naos::system::ServiceDirectory::unregister_request request{};
-	request.uri = {reinterpret_cast<const std::uint8_t *>(uri), uri_size};
+	request.uri = {uri, uri_size};
 	na_handle_t invocation = NA_HANDLE_INVALID;
 	auto transport = make_transport();
 	auto client = naos::system::ServiceDirectory::ServiceDirectoryClient(transport.async(), service_directory);
