@@ -1710,6 +1710,15 @@ int Sysdeps<Seek>::operator()(int fd, off_t offset, int whence, off_t *new_offse
 	const auto handle = naos_native::handle_for_fd(fd);
 	if (handle == NA_HANDLE_INVALID)
 		return EBADF;
+	na_handle_info_t info{};
+	info.struct_size = sizeof(info);
+	const auto info_status = _na_handle_get_info(handle, &info);
+	if (info_status != NA_STATUS_OK)
+		return naos_native::status_errno(info_status);
+	if (memcmp(info.protocol_uuid.bytes, naos::system::Stream::protocol_uuid.bytes, sizeof(info.protocol_uuid.bytes)) == 0)
+		return ESPIPE;
+	if (memcmp(info.protocol_uuid.bytes, naos::system::File::protocol_uuid.bytes, sizeof(info.protocol_uuid.bytes)) != 0)
+		return ESPIPE;
 	naos::system::File::seek_request request{};
 	request.offset = offset;
 	request.whence = whence;
