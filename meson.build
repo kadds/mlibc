@@ -16,11 +16,13 @@ endif
 fs = import('fs')
 
 naos_idl_compiler = find_program('python3')
-naos_idl_source_dir = meson.current_source_dir() / '../../../idl/system'
+naos_idl_root = meson.current_source_dir() / '../../../idl'
+naos_idl_script = naos_idl_root / 'naoidl.py'
+naos_idl_source_dir = naos_idl_root / 'system'
 naos_generated_include_dir = meson.current_build_dir()
 naos_generated_dir = naos_generated_include_dir / 'naos/generated/system'
 naos_generated_index = naos_generated_include_dir / 'naos/generated/system_uapi.h'
-naos_idl_template_dir = meson.current_source_dir() / '../../../util/templates/naoidl'
+naos_idl_template_dir = naos_idl_root / 'templates/cpp/naoidl'
 naos_idl_sources = [
 	naos_idl_source_dir / 'directory.naidl',
 	naos_idl_source_dir / 'file.naidl',
@@ -29,7 +31,13 @@ naos_idl_sources = [
 	naos_idl_source_dir / 'shared_ring.naidl',
 	naos_idl_source_dir / 'service_directory.naidl',
 	naos_idl_source_dir / 'stream.naidl',
-	naos_idl_source_dir / 'tty_control.naidl',
+	naos_idl_source_dir / 'input_event_source.naidl',
+	naos_idl_source_dir / 'terminal_driver_control.naidl',
+	naos_idl_source_dir / 'terminal_driver_factory.naidl',
+	naos_idl_source_dir / 'terminal_job_control.naidl',
+	naos_idl_source_dir / 'terminal_manager.naidl',
+	naos_idl_source_dir / 'terminal_master.naidl',
+	naos_idl_source_dir / 'terminal_slave.naidl',
 ]
 naos_idl_templates = [
 	naos_idl_template_dir / 'client.hpp.htt',
@@ -47,9 +55,9 @@ naos_idl_templates = [
 ]
 naos_system_idl = custom_target('naos-system-idl',
 	output: 'system_uapi.h',
-	command: [naos_idl_compiler, meson.current_source_dir() / '../../../util/naoidl.py',
+	command: [naos_idl_compiler, naos_idl_script,
 		'generate-system', naos_idl_source_dir, naos_generated_dir, naos_generated_index, '@OUTPUT@'],
-	depend_files: naos_idl_sources + naos_idl_templates + [meson.current_source_dir() / '../../../util/naoidl.py'],
+	depend_files: naos_idl_sources + naos_idl_templates + [naos_idl_script],
 	build_by_default: true,
 )
 naos_generated_include_dirs = include_directories('.')

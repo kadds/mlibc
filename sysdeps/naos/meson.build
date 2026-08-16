@@ -59,6 +59,14 @@ if not no_headers
 		'include/naos/fcntl.h',
 		subdir: 'naos'
 	)
+	install_headers(
+		'../../../../include/naos/framebuffer.h',
+		subdir: 'naos'
+	)
+	install_headers(
+		'../../../../include/linux/fb.h',
+		subdir: 'linux'
+	)
 endif
 
 if not headers_only

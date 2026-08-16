@@ -23,6 +23,7 @@
 /* _IOR('T', 0x30, int) and _IOW('T', 0x31, int) in the x86-64 ioctl ABI. */
 #define TIOCGPTN 0x80045430
 #define TIOCSPTLCK 0x40045431
+#define TIOCSPTLGRANT 0x40045432
 
 #define FIONBIO 0x5421
 #define FIONCLEX 0x5450

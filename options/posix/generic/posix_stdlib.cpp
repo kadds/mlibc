@@ -1,5 +1,6 @@
 
 #include <abi-bits/fcntl.h>
+#include <abi-bits/ioctls.h>
 #include <bits/ensure.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -482,7 +483,12 @@ int unlockpt(int fd) {
 	return 0;
 }
 
-int grantpt(int) {
+int grantpt(int fd) {
+	int granted = 0;
+	if (int e = mlibc::sysdep_or_enosys<Ioctl>(fd, TIOCSPTLGRANT, &granted, nullptr); e) {
+		errno = e;
+		return -1;
+	}
 	return 0;
 }
 

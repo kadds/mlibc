@@ -36,7 +36,8 @@ int openpty(int *mfd, int *sfd, char *name, const struct termios *ios, const str
 		goto fail;
 
 	int pts_fd;
-	unlockpt(ptmx_fd);
+	if (grantpt(ptmx_fd) != 0 || unlockpt(ptmx_fd) != 0)
+		goto fail;
 	if(int e = mlibc::sysdep<Open>(name, O_RDWR | O_NOCTTY, 0, &pts_fd); e) {
 		errno = e;
 		goto fail;

@@ -6,6 +6,11 @@
 #include <string.h>
 #include <limits.h>
 
+extern "C" int
+naos_native_preadv(int fd, const struct iovec *iovs, int iovc, off_t offset, ssize_t *bytes_read);
+extern "C" int naos_native_pwritev(
+		int fd, const struct iovec *iovs, int iovc, off_t offset, ssize_t *bytes_written);
+
 #include <bits/ensure.h>
 #include <frg/vector.hpp>
 #include <mlibc/all-sysdeps.hpp>
@@ -65,12 +70,20 @@ ssize_t writev(int fd, const struct iovec *iovs, int iovc) {
 	return written;
 }
 
-ssize_t preadv(int, const struct iovec *, int, off_t) {
-	__ensure(!"Not implemented");
-	__builtin_unreachable();
+ssize_t preadv(int fd, const struct iovec *iovs, int iovc, off_t offset) {
+	ssize_t read_bytes = 0;
+	if (int e = naos_native_preadv(fd, iovs, iovc, offset, &read_bytes); e) {
+		errno = e;
+		return -1;
+	}
+	return read_bytes;
 }
 
-ssize_t pwritev(int, const struct iovec *, int, off_t) {
-	__ensure(!"Not implemented");
-	__builtin_unreachable();
+ssize_t pwritev(int fd, const struct iovec *iovs, int iovc, off_t offset) {
+	ssize_t written = 0;
+	if (int e = naos_native_pwritev(fd, iovs, iovc, offset, &written); e) {
+		errno = e;
+		return -1;
+	}
+	return written;
 }
