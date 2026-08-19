@@ -31,8 +31,15 @@ struct ThreadExit { static constexpr bool is_noreturn = true; };
 // int sys_prepare_stack(void **stack, void *entry, void *user_arg, void* tcb, size_t *stack_size, size_t *guard_size, void **stack_base);
 struct PrepareStack {};
 
+// Releases resources returned by sys_prepare_stack after a failed clone.
+// PrepareStack remains responsible for cleanup when it returns an error.
+struct PrepareStackCleanup {};
+
 // int sys_clone(void *tcb, pid_t *pid_out, void *stack);
 struct Clone {};
+
+// Releases the TCB, its TLS state, and the allocation that contains it.
+struct TcbDestroy {};
 
 // int sys_futex_wait(int *pointer, int expected, const struct timespec *time);
 struct FutexWait {};

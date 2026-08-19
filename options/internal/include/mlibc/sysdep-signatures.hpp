@@ -60,7 +60,9 @@ SYSDEP_FUNC(RiscvHwprobe, struct riscv_hwprobe *pairs, size_t pair_count, size_t
 SYSDEP_FUNC_NORETURN(Exit, int status);
 SYSDEP_FUNC_NORETURN(ThreadExit);
 SYSDEP_FUNC(PrepareStack, void **stack, void *entry, void *user_arg, void* tcb, size_t *stack_size, size_t *guard_size, void **stack_base);
+SYSDEP_FUNC_RET(void, PrepareStackCleanup, void *stack, size_t stack_size, void *stack_base, size_t guard_size);
 SYSDEP_FUNC(Clone, void *tcb, pid_t *pid_out, void *stack);
+SYSDEP_FUNC_RET(void, TcbDestroy, void *tcb);
 SYSDEP_FUNC(FutexWait, int *pointer, int expected, const struct timespec *time);
 SYSDEP_FUNC(FutexWake, int *pointer, bool all);
 SYSDEP_FUNC(Open, const char *pathname, int flags, mode_t mode, int *fd);

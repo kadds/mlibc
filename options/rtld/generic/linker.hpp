@@ -18,6 +18,13 @@ struct SharedObject;
 struct ObjectSymbol;
 struct SymbolVersion;
 
+// The TCB is aligned inside a larger TLS allocation, so its address is not
+// necessarily the pointer that must be passed back to the allocator.
+struct TcbAllocation {
+	void *base;
+	size_t size;
+};
+
 extern uint64_t rtsCounter;
 
 enum class TlsModel {
@@ -356,12 +363,21 @@ struct RuntimeTlsMap {
 
 	// Track all allocated TCBs.
 	frg::vector<Tcb *, MemoryAllocator> tcbs;
+
+	struct TcbAllocationRecord {
+		Tcb *tcb;
+		void *base;
+		size_t size;
+	};
+	frg::vector<TcbAllocationRecord, MemoryAllocator> tcbAllocations;
 };
 
 extern frg::manual_box<FutexLock> runtimeTlsMapLock;
 extern frg::manual_box<RuntimeTlsMap> runtimeTlsMap;
 
 Tcb *allocateTcb();
+TcbAllocation releaseTcbResources(Tcb *tcb);
+void destroyTcb(Tcb *tcb);
 void initTlsObjects(Tcb *tcb, const frg::vector<SharedObject *, MemoryAllocator> &objects, bool checkInitialized);
 void *accessDtv(SharedObject *object);
 // Tries to access the DTV, if not allocated, or object doesn't have
@@ -544,4 +560,3 @@ extern "C" void pltRelocateStub() __attribute__((__visibility__("hidden")));
 // --------------------------------------------------------
 
 uintptr_t *rtld_auxvector();
-

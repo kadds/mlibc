@@ -29,6 +29,20 @@ constinit frg::array<
 
 FutexLock key_mutex_;
 
+constexpr int tcbDetached = 0;
+constexpr int tcbJoinable = 1;
+constexpr int tcbReapClaimed = 2;
+
+void cleanup_stack(void *stack, size_t stack_size, void *stack_base, size_t guard_size) {
+	if constexpr (mlibc::IsImplemented<PrepareStackCleanup>)
+		mlibc::sysdep<PrepareStackCleanup>(stack, stack_size, stack_base, guard_size);
+}
+
+void destroy_tcb(Tcb *tcb) {
+	if constexpr (mlibc::IsImplemented<TcbDestroy>)
+		mlibc::sysdep<TcbDestroy>(tcb);
+}
+
 } // namespace
 
 extern "C" int __cxa_thread_atexit_impl(void (*function)(void *), void *argument,
@@ -112,23 +126,41 @@ int thread_create(struct __mlibc_thread_data **__restrict thread, const struct _
 	void *stack = attr.__stackaddr;
 	if (!IsImplemented<PrepareStack>) {
 		MLIBC_MISSING_SYSDEP();
+		destroy_tcb(new_tcb);
 		return ENOSYS;
 	}
 	int ret = sysdep_or_panic<PrepareStack>(&stack, entry,
-			user_arg, new_tcb, &attr.__stacksize, &attr.__guardsize, &new_tcb->stackAddr);
-	if (ret)
+		user_arg, new_tcb, &attr.__stacksize, &attr.__guardsize, &new_tcb->stackAddr);
+	if (ret) {
+		destroy_tcb(new_tcb);
 		return ret;
+	}
 
 	if (!IsImplemented<Clone>) {
 		MLIBC_MISSING_SYSDEP();
+		cleanup_stack(stack, attr.__stacksize, new_tcb->stackAddr, attr.__guardsize);
+		destroy_tcb(new_tcb);
 		return ENOSYS;
 	}
 	new_tcb->stackSize = attr.__stacksize;
 	new_tcb->guardSize = attr.__guardsize;
 	new_tcb->returnValueType = (returns_int) ? TcbThreadReturnValue::Integer : TcbThreadReturnValue::Pointer;
-	new_tcb->isJoinable = (attr.__detachstate == __MLIBC_THREAD_CREATE_JOINABLE);
+	if constexpr (mlibc::IsImplemented<TcbDestroy>)
+		new_tcb->isJoinable = (attr.__detachstate == __MLIBC_THREAD_CREATE_JOINABLE)
+				? tcbJoinable : tcbDetached;
+	else
+		new_tcb->isJoinable = (attr.__detachstate == __MLIBC_THREAD_CREATE_JOINABLE);
 	__atomic_store_n(&new_tcb->cancelBits, 0, __ATOMIC_RELAXED);
-	sysdep_or_panic<Clone>(new_tcb, &tid, stack);
+	if constexpr (mlibc::IsImplemented<TcbDestroy>) {
+		ret = sysdep_or_panic<Clone>(new_tcb, &tid, stack);
+		if (ret) {
+			cleanup_stack(stack, attr.__stacksize, new_tcb->stackAddr, attr.__guardsize);
+			destroy_tcb(new_tcb);
+			return ret;
+		}
+	} else {
+		sysdep_or_panic<Clone>(new_tcb, &tid, stack);
+	}
 	*thread = reinterpret_cast<struct __mlibc_thread_data *>(new_tcb);
 
 	__atomic_store_n(&new_tcb->tid, tid, __ATOMIC_RELAXED);
@@ -140,15 +172,21 @@ int thread_create(struct __mlibc_thread_data **__restrict thread, const struct _
 int thread_join(struct __mlibc_thread_data *thread, void *ret) {
 	auto tcb = reinterpret_cast<Tcb *>(thread);
 
-	if(!tcb->isJoinable) {
-		mlibc::infoLogger() << "mlibc: pthread_join() called on a detached thread" << frg::endlog;
-		return EINVAL;
+	if constexpr (mlibc::IsImplemented<TcbDestroy>) {
+		mlibc::thread_testcancel();
+		int expected = tcbJoinable;
+		if(!__atomic_compare_exchange_n(&tcb->isJoinable, &expected, tcbReapClaimed,
+				false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+			return EINVAL;
+	} else {
+		if(!tcb->isJoinable) {
+			mlibc::infoLogger() << "mlibc: pthread_join() called on a detached thread" << frg::endlog;
+			return EINVAL;
+		}
+		if (!__atomic_load_n(&tcb->isJoinable, __ATOMIC_ACQUIRE))
+			return EINVAL;
+		mlibc::thread_testcancel();
 	}
-
-	if (!__atomic_load_n(&tcb->isJoinable, __ATOMIC_ACQUIRE))
-		return EINVAL;
-
-	mlibc::thread_testcancel();
 
 	while (!__atomic_load_n(&tcb->didExit, __ATOMIC_ACQUIRE)) {
 		if (int e = sysdep<FutexWait>(&tcb->didExit, 0, nullptr); e == EINTR)
@@ -160,20 +198,32 @@ int thread_join(struct __mlibc_thread_data *thread, void *ret) {
 	else if(ret && tcb->returnValueType == TcbThreadReturnValue::Integer)
 		*reinterpret_cast<int *>(ret) = tcb->returnValue.integer;
 
-	// FIXME: destroy tcb here, currently we leak it
+	destroy_tcb(tcb);
 
 	return 0;
 }
 
 int thread_detach(struct __mlibc_thread_data *thread) {
 	auto tcb = reinterpret_cast<Tcb *>(thread);
-	if (!__atomic_load_n(&tcb->isJoinable, __ATOMIC_RELAXED))
-		return EINVAL;
-
-	int expected = 1;
-	if(!__atomic_compare_exchange_n(&tcb->isJoinable, &expected, 0, false, __ATOMIC_RELEASE,
+	if constexpr (mlibc::IsImplemented<TcbDestroy>) {
+		int expected = tcbJoinable;
+		if(!__atomic_compare_exchange_n(&tcb->isJoinable, &expected, tcbDetached, false,
+				__ATOMIC_RELEASE, __ATOMIC_RELAXED))
+			return EINVAL;
+		if(__atomic_load_n(&tcb->didExit, __ATOMIC_ACQUIRE)) {
+			expected = tcbDetached;
+			if(__atomic_compare_exchange_n(&tcb->isJoinable, &expected, tcbReapClaimed,
+					false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+				destroy_tcb(tcb);
+		}
+	} else {
+		if (!__atomic_load_n(&tcb->isJoinable, __ATOMIC_RELAXED))
+			return EINVAL;
+		int expected = 1;
+		if(!__atomic_compare_exchange_n(&tcb->isJoinable, &expected, 0, false, __ATOMIC_RELEASE,
 				__ATOMIC_RELAXED))
-		return EINVAL;
+			return EINVAL;
+	}
 
 	return 0;
 }
@@ -223,7 +273,14 @@ __attribute__ ((__noreturn__)) void thread_exit(thread_exit_return ret_val) {
 	__atomic_store_n(&self->didExit, 1, __ATOMIC_RELEASE);
 	sysdep<FutexWake>(&self->didExit, true);
 
-	// TODO: clean up thread resources when we are detached.
+	if constexpr (mlibc::IsImplemented<TcbDestroy>) {
+		if(__atomic_load_n(&self->isJoinable, __ATOMIC_ACQUIRE) == tcbDetached) {
+			int expected = tcbDetached;
+			if(__atomic_compare_exchange_n(&self->isJoinable, &expected, tcbReapClaimed,
+					false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+				destroy_tcb(self);
+		}
+	}
 
 	// TODO: do exit(0) when we're the only thread instead
 	mlibc::do_exit();

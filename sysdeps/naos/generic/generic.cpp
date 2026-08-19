@@ -37,6 +37,7 @@
 #include <naos/outcome.hpp>
 #include <naos/service_directory.hpp>
 #include <naos/syscall.h>
+#include <mlibc/naos-tcb.hpp>
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -44,6 +45,16 @@
 #include <string.h>
 #include <sys/uio.h>
 #include <termios.h>
+
+static_assert(sizeof(naos_tls_abi_v1_t) == 0x38);
+static_assert(offsetof(Tcb, selfPointer) == offsetof(naos_tls_abi_v1_t, self_pointer));
+static_assert(offsetof(Tcb, dtvSize) == offsetof(naos_tls_abi_v1_t, dtv_size));
+static_assert(offsetof(Tcb, dtvPointers) == offsetof(naos_tls_abi_v1_t, dtv_pointer));
+static_assert(offsetof(Tcb, tid) == offsetof(naos_tls_abi_v1_t, tid));
+static_assert(offsetof(Tcb, didExit) == offsetof(naos_tls_abi_v1_t, did_exit));
+static_assert(offsetof(Tcb, stackCanary) == offsetof(naos_tls_abi_v1_t, stack_canary));
+static_assert(offsetof(Tcb, cancelBits) == offsetof(naos_tls_abi_v1_t, cancel_bits));
+static_assert(sizeof(Tcb::cancelBits) == sizeof(uint32_t));
 
 #define SYS_CALL(index, name)                                                                      \
 	__asm__(".globl " #name " \n\t "                                                               \
@@ -5481,6 +5492,16 @@ int Sysdeps<PrepareStack>::operator()(
 	return 0;
 }
 
+void Sysdeps<PrepareStackCleanup>::operator()(
+	void *stack, size_t stack_size, void *stack_base, size_t guard_size
+) {
+	(void)stack_size;
+	(void)stack_base;
+	(void)guard_size;
+	if (stack)
+		getAllocator().deallocate(stack, sizeof(NaosThreadContext));
+}
+
 [[noreturn]] void Sysdeps<ThreadExit>::operator()() {
 	_s_exit_thread(0);
 	__builtin_unreachable();
@@ -5493,6 +5514,10 @@ int Sysdeps<Clone>::operator()(void *tcb, pid_t *pid_out, void *stack) {
 
 	*pid_out = ret;
 	return 0;
+}
+
+void Sysdeps<TcbDestroy>::operator()(void *tcb) {
+	destroyTcb(static_cast<Tcb *>(tcb));
 }
 
 int Sysdeps<Execve>::operator()(const char *path, char *const argv[], char *const envp[]) {

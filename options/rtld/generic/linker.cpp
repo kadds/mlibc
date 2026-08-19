@@ -1393,7 +1393,8 @@ void doDestruct(SharedObject *object) {
 // --------------------------------------------------------
 
 RuntimeTlsMap::RuntimeTlsMap()
-: initialPtr{0}, initialLimit{0}, indices{getAllocator()}, tcbs{getAllocator()} { }
+: initialPtr{0}, initialLimit{0}, indices{getAllocator()}, tcbs{getAllocator()},
+	tcbAllocations{getAllocator()} { }
 
 void initTlsObjects(Tcb *tcb, const frg::vector<SharedObject *, MemoryAllocator> &objects, bool checkInitialized) {
 	// Initialize TLS segments that follow the static model.
@@ -1496,8 +1497,70 @@ Tcb *allocateTcb() {
 	}
 
 	runtimeTlsMap->tcbs.push_back(tcb_ptr);
+	runtimeTlsMap->tcbAllocations.push_back({
+		tcb_ptr,
+		reinterpret_cast<void *>(allocation),
+		allocSize
+	});
 
 	return tcb_ptr;
+}
+
+TcbAllocation releaseTcbResources(Tcb *tcb) {
+	frg::unique_lock lock{*runtimeTlsMapLock};
+
+	for(size_t i = 0; i < runtimeTlsMap->tcbs.size(); i++) {
+		if(runtimeTlsMap->tcbs[i] == tcb) {
+			runtimeTlsMap->tcbs[i] = runtimeTlsMap->tcbs.back();
+			runtimeTlsMap->tcbs.resize(runtimeTlsMap->tcbs.size() - 1);
+			break;
+		}
+	}
+
+	TcbAllocation allocation{};
+	for(size_t i = 0; i < runtimeTlsMap->tcbAllocations.size(); i++) {
+		if(runtimeTlsMap->tcbAllocations[i].tcb == tcb) {
+			allocation.base = runtimeTlsMap->tcbAllocations[i].base;
+			allocation.size = runtimeTlsMap->tcbAllocations[i].size;
+			runtimeTlsMap->tcbAllocations[i] = runtimeTlsMap->tcbAllocations.back();
+			runtimeTlsMap->tcbAllocations.resize(runtimeTlsMap->tcbAllocations.size() - 1);
+			break;
+		}
+	}
+
+	void **dtv = tcb->dtvPointers;
+	const size_t objectCount = tcb->dtvSize < runtimeTlsMap->indices.size()
+			? tcb->dtvSize : runtimeTlsMap->indices.size();
+	for(size_t i = 0; i < objectCount; i++) {
+		if(runtimeTlsMap->indices[i]->tlsModel == TlsModel::dynamic && dtv[i])
+			getAllocator().deallocate(dtv[i], runtimeTlsMap->indices[i]->tlsSegmentSize);
+	}
+	if(dtv && tcb->dtvSize)
+		getAllocator().deallocate(dtv, sizeof(void *) * tcb->dtvSize);
+	if(tcb->localKeys)
+		frg::destruct(getAllocator(), tcb->localKeys);
+
+	while(tcb->cxaThreadExitHandlers) {
+		auto handler = tcb->cxaThreadExitHandlers;
+		tcb->cxaThreadExitHandlers = handler->next;
+		frg::destruct(getAllocator(), handler);
+	}
+	while(!tcb->cleanupHandlers.empty()) {
+		auto handler = tcb->cleanupHandlers.pop_back();
+		frg::destruct(getAllocator(), handler);
+	}
+
+	tcb->dtvPointers = nullptr;
+	tcb->dtvSize = 0;
+	tcb->localKeys = nullptr;
+	return allocation;
+}
+
+void destroyTcb(Tcb *tcb) {
+	auto allocation = releaseTcbResources(tcb);
+	tcb->~Tcb();
+	if(allocation.base)
+		getAllocator().deallocate(allocation.base, allocation.size);
 }
 
 void *accessDtv(SharedObject *object) {
@@ -2475,4 +2538,3 @@ void Loader::_processLazyRelocations(SharedObject *object) {
 		}
 	}
 }
-
