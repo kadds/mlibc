@@ -21,6 +21,7 @@ struct NaosSysdepTags :
 	FutexTid,
 	FutexWait,
 	FutexWake,
+	GetEntropy,
 	GetEgid,
 	GetEuid,
 	GetCwd,
@@ -87,6 +88,7 @@ struct NaosSysdepTags :
 	Write,
 	Yield,
 	Poll,
+	Pselect,
 	Ptsname,
 	Pipe
 {};

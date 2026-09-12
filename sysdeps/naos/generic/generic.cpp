@@ -11,16 +11,17 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/fb.h>
 #include <limits.h>
 #include <mlibc/all-sysdeps.hpp>
 #include <mlibc/allocator.hpp>
 #include <mlibc/debug.hpp>
 #include <mlibc/fsfd_target.hpp>
+#include <mlibc/naos-tcb.hpp>
 #include <mlibc/tcb.hpp>
 #include <mlibc/threads.hpp>
 #include <naos/abi.h>
 #include <naos/canonical.hpp>
-#include <linux/fb.h>
 #include <naos/generated/system/Directory.hpp>
 #include <naos/generated/system/File.hpp>
 #include <naos/generated/system/Process.hpp>
@@ -34,16 +35,17 @@
 #include <naos/generated/system/TerminalSlave.hpp>
 #include <naos/generated/system/TerminalSlave_client.hpp>
 #include <naos/generated/system_uapi.h>
+#include <naos/libnao.hpp>
 #include <naos/outcome.hpp>
 #include <naos/service_directory.hpp>
 #include <naos/syscall.h>
-#include <mlibc/naos-tcb.hpp>
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/uio.h>
+#include <sys/select.h>
 #include <termios.h>
 
 static_assert(sizeof(naos_tls_abi_v1_t) == 0x38);
@@ -74,6 +76,7 @@ static_assert(sizeof(Tcb::cancelBits) == sizeof(uint32_t));
 SYS_CALL(0, _s_none)
 SYS_CALL(1, _s_log)
 SYS_CALL(2, _s_clock)
+SYS_CALL(45, _s_getrandom)
 
 // Native object-call ABI. These wrappers intentionally expose the kernel's
 // status return directly; the adapter below maps it to POSIX errno values.
@@ -82,25 +85,29 @@ SYS_CALL(18, _na_channel_create)
 SYS_CALL(19, _na_channel_send)
 SYS_CALL(20, _na_channel_receive)
 SYS_CALL(21, _na_channel_discard)
-SYS_CALL(22, _na_handle_wait_many)
-SYS_CALL(23, _na_handle_duplicate)
-SYS_CALL(24, _na_handle_restrict)
-SYS_CALL(25, _na_handle_get_info)
-SYS_CALL(26, _na_protocol_descriptor_create)
-SYS_CALL(27, _na_protocol_endpoint_create)
-SYS_CALL(28, _na_invoke_submit)
-SYS_CALL(29, _na_invoke_oneway)
-SYS_CALL(30, _na_invocation_cancel)
-SYS_CALL(31, _na_invocation_take_result)
-SYS_CALL(32, _na_responder_reply)
-SYS_CALL(33, _na_responder_fail)
-SYS_CALL(34, _na_bootstrap)
-SYS_CALL(36, _na_memory_map)
-SYS_CALL(37, _na_memory_unmap)
-SYS_CALL(38, _na_process_exec)
-SYS_CALL(39, _na_process_handle_open)
-SYS_CALL(40, _na_process_spawn)
-SYS_CALL(41, _na_pipe_create)
+SYS_CALL(22, _na_epoll_create)
+SYS_CALL(23, _na_epoll_ctl)
+SYS_CALL(24, _na_epoll_wait)
+SYS_CALL(25, _na_handle_duplicate)
+SYS_CALL(26, _na_handle_restrict)
+SYS_CALL(27, _na_handle_get_info)
+SYS_CALL(28, _na_protocol_descriptor_create)
+SYS_CALL(29, _na_protocol_endpoint_create)
+SYS_CALL(30, _na_invoke_submit)
+SYS_CALL(31, _na_invoke_oneway)
+SYS_CALL(32, _na_invocation_cancel)
+SYS_CALL(33, _na_invocation_take_result)
+SYS_CALL(34, _na_responder_reply)
+SYS_CALL(35, _na_responder_fail)
+SYS_CALL(36, _na_bootstrap)
+SYS_CALL(38, _na_memory_map)
+SYS_CALL(39, _na_memory_unmap)
+SYS_CALL(40, _na_process_exec)
+SYS_CALL(41, _na_process_handle_open)
+SYS_CALL(42, _na_process_spawn)
+SYS_CALL(43, _na_pipe_create)
+SYS_CALL(44, _na_memory_create)
+SYS_CALL(46, _na_power_off)
 
 #define OPEN_MODE_READ 1
 #define OPEN_MODE_WRITE 2
@@ -264,7 +271,6 @@ namespace mlibc {
 
 namespace naos_native {
 
-constexpr uint64_t result_capacity = NA_CHANNEL_MAX_MESSAGE_BYTES;
 constexpr uint64_t resource_capacity = NA_CHANNEL_MAX_RESOURCES;
 constexpr int max_fds = 1024;
 constexpr uint64_t terminal_status_nonblock = 4;
@@ -292,11 +298,11 @@ struct fd_slot {
 };
 
 struct call_result {
-	uint8_t *bytes;
-	uint64_t byte_count;
-	na_handle_t resources[resource_capacity];
-	uint64_t resource_count;
-	na_result_frame_t frame;
+	uint8_t *bytes = nullptr;
+	uint64_t byte_count = 0;
+	na_handle_t resources[resource_capacity] = {};
+	uint64_t resource_count = 0;
+	na_result_frame_t frame = {};
 };
 
 void destroy_result(call_result &result);
@@ -308,6 +314,168 @@ int native_call(
     call_result &result
 );
 
+int native_call_with_resources(
+    na_handle_t target,
+    uint64_t method,
+    const void *request,
+    uint64_t request_bytes,
+    na_resource_disposition_t *dispositions,
+    uint64_t disposition_count,
+    call_result &result
+);
+
+// Defined with the errno mapping table further down; the region helpers above
+// it need the syscall-status conversion.
+int status_errno(uint64_t status);
+
+// Request envelopes and result frames are small control messages; the old
+// per-call full-size allocation only made every I/O call touch 64 KiB of heap.
+// Each thread now reuses one grow-only buffer per direction, which also keeps
+// concurrent I/O on different threads from serializing on a shared lock.
+constexpr uint64_t call_scratch_bytes = 4096;
+
+thread_local uint8_t *request_scratch = nullptr;
+thread_local uint64_t request_scratch_capacity = 0;
+thread_local uint8_t *result_scratch = nullptr;
+thread_local uint64_t result_scratch_capacity = 0;
+
+// Grow-only bulk payload region. A memory object the client owns, created on
+// first use and enlarged in place when a transfer needs a bigger window so the
+// common path pays no MEMORY_CREATE, MEMORY_MAP or MEMORY_UNMAP per call.
+struct bulk_region {
+	na_handle_t handle = NA_HANDLE_INVALID;
+	uint8_t *address = nullptr;
+	uint64_t size = 0;
+};
+
+thread_local bulk_region thread_bulk_region;
+thread_local na_handle_t prepared_bulk_view = NA_HANDLE_INVALID;
+
+int grow_call_buffer(uint8_t *&buffer, uint64_t &capacity, uint64_t required) {
+	uint64_t next = required < call_scratch_bytes ? call_scratch_bytes : required;
+	next = (next + call_scratch_bytes - 1) & ~(call_scratch_bytes - 1);
+	if (next <= capacity)
+		return 0;
+	auto *grown = static_cast<uint8_t *>(getAllocator().allocate(next));
+	if (grown == nullptr)
+		return ENOMEM;
+	if (buffer != nullptr)
+		getAllocator().deallocate(buffer, capacity);
+	buffer = grown;
+	capacity = next;
+	return 0;
+}
+
+int ensure_request_scratch() {
+	if (request_scratch == nullptr)
+		return grow_call_buffer(request_scratch, request_scratch_capacity, call_scratch_bytes);
+	return 0;
+}
+
+int ensure_result_scratch() {
+	if (result_scratch == nullptr)
+		return grow_call_buffer(result_scratch, result_scratch_capacity, call_scratch_bytes);
+	return 0;
+}
+
+// Encode `request` into the thread's request buffer. The generated encoders
+// store the full encoded size in `written` before rejecting a short capacity,
+// so a size past the current capacity means the request needs a bigger buffer
+// rather than that the request is invalid.
+template <typename Request, typename Encoder>
+int encode_request(const Request &request, Encoder encoder, uint8_t *&wire, uint64_t &wire_bytes) {
+	for (;;) {
+		int error = ensure_request_scratch();
+		if (error != 0)
+			return error;
+		uint64_t written = 0;
+		if (encoder(request_scratch, request_scratch_capacity, request, written)) {
+			wire = written == 0 ? nullptr : request_scratch;
+			wire_bytes = written;
+			return 0;
+		}
+		if (written <= request_scratch_capacity)
+			return EINVAL;
+		error = grow_call_buffer(request_scratch, request_scratch_capacity, written);
+		if (error != 0)
+			return error;
+	}
+}
+
+// Map a caller-owned region of at least `length` bytes and describe it as
+// resource slot 0 for a `duplicate` disposition. The window the caller grants
+// is the whole mapped region.
+int prepare_bulk_region(uint64_t length, na_resource_disposition_t &disposition, uint64_t &window) {
+	if (length > NA_MEMORY_OBJECT_MAX_BYTES)
+		return EOVERFLOW;
+	if (thread_bulk_region.handle == NA_HANDLE_INVALID || length > thread_bulk_region.size) {
+		uint64_t next = (length + call_scratch_bytes - 1) & ~(call_scratch_bytes - 1);
+		if (next < call_scratch_bytes)
+			next = call_scratch_bytes;
+		na_handle_t fresh = NA_HANDLE_INVALID;
+		const auto create_status = _na_memory_create(next, 0, &fresh);
+		if (create_status != NA_STATUS_OK)
+			return status_errno(create_status);
+		na_memory_map_frame_t frame{};
+		frame.struct_size = sizeof(frame);
+		frame.flags = NA_MEMORY_MAP_READ | NA_MEMORY_MAP_WRITE | NA_MEMORY_MAP_SHARED;
+		frame.object = fresh;
+		frame.length = next;
+		const auto map_status = _na_memory_map(&frame);
+		if (map_status != NA_STATUS_OK) {
+			_na_handle_close(fresh);
+			return status_errno(map_status);
+		}
+		if (thread_bulk_region.handle != NA_HANDLE_INVALID) {
+			na_memory_unmap_frame_t unmap{};
+			unmap.struct_size = sizeof(unmap);
+			unmap.address = reinterpret_cast<uint64_t>(thread_bulk_region.address);
+			unmap.length = thread_bulk_region.size;
+			(void)_na_memory_unmap(&unmap);
+			(void)_na_handle_close(thread_bulk_region.handle);
+		}
+		thread_bulk_region.handle = fresh;
+		thread_bulk_region.address = reinterpret_cast<uint8_t *>(frame.address);
+		thread_bulk_region.size = next;
+	}
+    if (prepared_bulk_view != NA_HANDLE_INVALID) {
+        (void)_na_handle_close(prepared_bulk_view);
+        prepared_bulk_view = NA_HANDLE_INVALID;
+    }
+    na_handle_t duplicate = NA_HANDLE_INVALID;
+    auto status = _na_handle_duplicate(thread_bulk_region.handle, 0, &duplicate);
+    if (status != NA_STATUS_OK)
+        return status_errno(status);
+    na_handle_restriction_t restriction{};
+    restriction.struct_size = sizeof(restriction);
+    restriction.flags = NA_RESTRICTION_RANGE;
+    restriction.view_offset = 0;
+    restriction.view_length = length;
+    na_handle_t view = NA_HANDLE_INVALID;
+    status = _na_handle_restrict(duplicate, &restriction, &view);
+    (void)_na_handle_close(duplicate);
+    if (status != NA_STATUS_OK)
+        return status_errno(status);
+    prepared_bulk_view = view;
+    disposition = {};
+    disposition.handle = view;
+    disposition.operation = NA_RESOURCE_DUPLICATE;
+    disposition.scope = NA_SCOPE_MEMORY_OBJECT;
+    window = length;
+    return 0;
+}
+
+template <typename Request>
+int attach_bulk_region(Request &request, uint64_t length, na_resource_disposition_t &disposition) {
+	uint64_t window = 0;
+	const int error = prepare_bulk_region(length, disposition, window);
+	if (error != 0)
+		return error;
+	request.buffer.value = 0;
+	(void)window;
+	return 0;
+}
+
 template <typename Request, typename Encoder>
 int encoded_native_call(
     na_handle_t target,
@@ -316,17 +484,34 @@ int encoded_native_call(
     Encoder encoder,
     call_result &result
 ) {
-	auto *wire = static_cast<uint8_t *>(getAllocator().allocate(result_capacity));
-	if (wire == nullptr)
-		return ENOMEM;
-	uint64_t written = 0;
-	if (!encoder(wire, result_capacity, request, written)) {
-		getAllocator().deallocate(wire, result_capacity);
-		return EINVAL;
-	}
-	const int error = native_call(target, method, written == 0 ? nullptr : wire, written, result);
-	getAllocator().deallocate(wire, result_capacity);
-	return error;
+	result = {};
+	uint8_t *wire = nullptr;
+	uint64_t wire_bytes = 0;
+	const int error = encode_request(request, encoder, wire, wire_bytes);
+	if (error != 0)
+		return error;
+	return native_call(target, method, wire, wire_bytes, result);
+}
+
+template <typename Request, typename Encoder>
+int encoded_native_call_with_resources(
+    na_handle_t target,
+    uint64_t method,
+    const Request &request,
+    Encoder encoder,
+    na_resource_disposition_t *dispositions,
+    uint64_t disposition_count,
+    call_result &result
+) {
+	result = {};
+	uint8_t *wire = nullptr;
+	uint64_t wire_bytes = 0;
+	const int error = encode_request(request, encoder, wire, wire_bytes);
+	if (error != 0)
+		return error;
+	return native_call_with_resources(
+	    target, method, wire, wire_bytes, dispositions, disposition_count, result
+	);
 }
 
 template <typename StatValue>
@@ -368,16 +553,11 @@ bool decode_directory_stat(const uint8_t *bytes, uint64_t size, struct stat &val
 }
 
 fd_slot fd_slots[max_fds] = {};
-na_handle_t root_directory = NA_HANDLE_INVALID;
-na_handle_t current_directory = NA_HANDLE_INVALID;
 na_handle_t service_directory = NA_HANDLE_INVALID;
-na_bootstrap_capability_t bootstrap_capabilities[NA_BOOTSTRAP_MAX_CAPABILITIES] = {};
-uint32_t bootstrap_capability_count = 0;
 bool bootstrapped = false;
 volatile uint32_t fd_lock = 0;
 
 int ensure_bootstrap();
-extern "C" int naos_take_bootstrap_capability(uint32_t kind, na_handle_t *handle);
 int terminal_job_control_for(na_handle_t endpoint, bool master, na_handle_t &job_control);
 int terminal_clone_binding(
     na_handle_t endpoint,
@@ -396,17 +576,288 @@ void lock_fds() {
 }
 
 void unlock_fds() { __atomic_store_n(&fd_lock, 0, __ATOMIC_RELEASE); }
+// ---------------------------------------------------------------------------
+// Runtime root/cwd ownership (USERSPACE_FILESYSTEM_PRD §5.2, §5.3 item 4,
+// §6 Phase 3): mlibc owns the root and current-directory bindings itself;
+// SET_CURRENT/SET_ROOT are frozen compatibility no-ops and are never sent.
+// A binding refcounts one native Directory handle; dup()/fchdir() share the
+// SAME handle via runtime reference counting and NEVER call
+// _na_handle_duplicate for File/Directory handles (PRD §5.2 rule).
+struct directory_binding {
+	na_handle_t handle = NA_HANDLE_INVALID;
+	// Peer-provided visible-root identity (e.g. mount-derived pseudo st_dev),
+	// zero until a peer reports one.
+	uint64_t visible_root_identity = 0;
+	// Number of roles (root / cwd) currently attached to this binding.
+	uint32_t refs = 0;
+	bool active = false;
+	// True when the binding registered a claim in shared_handles instead of
+	// uniquely owning the native handle.
+	bool shared_claim = false;
+};
+
+constexpr int max_directory_bindings = 8;
+directory_binding directory_bindings[max_directory_bindings];
+directory_binding *root_binding = nullptr;
+directory_binding *current_binding = nullptr;
+
+// Reference counts for native handles shared by more than one runtime owner
+// (dup'ed File/Directory descriptors, fchdir-shared cwd handles). Handles
+// without a table entry have exactly one owner. Callers hold fd_lock.
+struct shared_handle_ref {
+	na_handle_t handle = NA_HANDLE_INVALID;
+	uint32_t owners = 0;
+};
+shared_handle_ref shared_handles[max_fds];
+
+// Register one additional runtime owner of `handle`. The first caller turns
+// the implicit single owner into an explicit count of two. Returns false when
+// the tracking table is full; callers fall back to _na_handle_duplicate then.
+bool shared_retain(na_handle_t handle) {
+	if (handle == NA_HANDLE_INVALID)
+		return false;
+	for (auto &ref : shared_handles) {
+		if (ref.owners != 0 && ref.handle == handle) {
+			ref.owners++;
+			return true;
+		}
+	}
+	for (auto &ref : shared_handles) {
+		if (ref.owners == 0) {
+			ref.handle = handle;
+			ref.owners = 2;
+			return true;
+		}
+	}
+	return false;
+}
+
+// Drop one runtime owner of `handle`. Returns true when the caller removed
+// the last owner and must close the native handle itself.
+bool shared_release(na_handle_t handle) {
+	for (auto &ref : shared_handles) {
+		if (ref.owners != 0 && ref.handle == handle) {
+			ref.owners--;
+			if (ref.owners == 0)
+				ref.handle = NA_HANDLE_INVALID;
+			return ref.owners == 0;
+		}
+	}
+	return true;
+}
+
+na_handle_t root_directory() {
+	return root_binding != nullptr ? root_binding->handle : NA_HANDLE_INVALID;
+}
+
+na_handle_t current_directory() {
+	return current_binding != nullptr ? current_binding->handle : NA_HANDLE_INVALID;
+}
+
+// Attach a new role to `handle`. When a binding already wraps this exact
+// native handle it is reused (root and cwd share one binding after chroot).
+// Otherwise a fresh binding takes either unique ownership or, when `shared`
+// is set, an additional counted claim on a handle owned elsewhere too.
+directory_binding *binding_acquire(na_handle_t handle, bool shared) {
+	if (handle == NA_HANDLE_INVALID)
+		return nullptr;
+	for (auto &binding : directory_bindings) {
+		if (binding.active && binding.handle == handle) {
+			binding.refs++;
+			return &binding;
+		}
+	}
+	directory_binding *binding = nullptr;
+	for (auto &candidate : directory_bindings) {
+		if (!candidate.active) {
+			binding = &candidate;
+			break;
+		}
+	}
+	if (binding == nullptr)
+		return nullptr;
+	if (shared && !shared_retain(handle))
+		return nullptr;
+	binding->handle = handle;
+	binding->visible_root_identity = 0;
+	binding->refs = 1;
+	binding->active = true;
+	binding->shared_claim = shared;
+	return binding;
+}
+
+void binding_unref(directory_binding *binding) {
+	if (binding == nullptr)
+		return;
+	if (binding->refs > 0)
+		binding->refs--;
+	if (binding->refs != 0)
+		return;
+	const auto handle = binding->handle;
+	const bool was_shared = binding->shared_claim;
+	binding->active = false;
+	binding->handle = NA_HANDLE_INVALID;
+	binding->shared_claim = false;
+	bool close_now = true;
+	if (was_shared)
+		close_now = shared_release(handle);
+	if (close_now && handle != NA_HANDLE_INVALID)
+		_na_handle_close(handle);
+}
+
+void set_current_binding(directory_binding *binding) {
+	lock_fds();
+	directory_binding *old = current_binding;
+	current_binding = binding;
+	unlock_fds();
+	binding_unref(old);
+}
+
+void set_root_and_current_binding(directory_binding *binding) {
+	// chroot (PRD §6.3): root and cwd attach to the SAME restricted binding.
+	binding->refs++;
+	lock_fds();
+	directory_binding *old_root = root_binding;
+	directory_binding *old_current = current_binding;
+	root_binding = binding;
+	current_binding = binding;
+	unlock_fds();
+	binding_unref(old_root);
+	binding_unref(old_current);
+}
+
+// ---------------------------------------------------------------------------
+// Transitional revision-2 capability probe. Probed ONCE per process against
+// the root Directory peer; every rev2 call site falls back to its documented
+// legacy path while the probe reports unsupported (the Phase-3 kernel VFS
+// adapter answers NOT_SUPPORTED). Removing the kernel adapter in Phase 4
+// reduces to deleting this probe and the guarded branches.
+enum class directory_revision_support : uint8_t { unknown, rev2, legacy };
+directory_revision_support directory_revision_state = directory_revision_support::unknown;
+
+enum class file_materialize_support : uint8_t { unknown, available, unavailable };
+file_materialize_support file_materialize_state = file_materialize_support::unknown;
+
+bool directory_supports_revision2() {
+	if (directory_revision_state == directory_revision_support::unknown) {
+		naos::system::Directory::clone_binding_request request{};
+		call_result result{};
+		const int error = encoded_native_call(
+		    root_directory(),
+		    NA_METHOD_DIRECTORY_CLONE_BINDING,
+		    request,
+		    naos::system::Directory::encode_clone_binding_request,
+		    result
+		);
+		// destroy_result drops the cloned endpoint carried by a successful
+		// response; failed responses never carry live resources.
+		destroy_result(result);
+		directory_revision_state =
+		    error == 0 ? directory_revision_support::rev2 : directory_revision_support::legacy;
+	}
+	return directory_revision_state == directory_revision_support::rev2;
+}
+
+// Obtain a new unique Directory endpoint for `directory` via the revision-2
+// clone_binding method (PRD §5.3 item 6 disposition rules).
+int clone_directory_binding(na_handle_t directory, na_handle_t &clone) {
+	clone = NA_HANDLE_INVALID;
+	if (directory == NA_HANDLE_INVALID)
+		return EBADF;
+	naos::system::Directory::clone_binding_request request{};
+	call_result result{};
+	const int error = encoded_native_call(
+	    directory,
+	    NA_METHOD_DIRECTORY_CLONE_BINDING,
+	    request,
+	    naos::system::Directory::encode_clone_binding_request,
+	    result
+	);
+	if (error != 0) {
+		destroy_result(result);
+		return error;
+	}
+	naos::system::Directory::clone_binding_response response{};
+	if (!naos::system::Directory::decode_clone_binding_response(
+	        result.bytes, result.byte_count, response
+	    )
+	    || response.directory.value >= result.resource_count) {
+		destroy_result(result);
+		return EIO;
+	}
+	clone = result.resources[response.directory.value];
+	result.resources[response.directory.value] = NA_HANDLE_INVALID;
+	destroy_result(result);
+	return 0;
+}
+
+// Materialize a regular-file snapshot into a read-only MemoryObject
+// (File.revision 4 materialize, PRD §5.3 item 1). Used for MAP_PRIVATE file
+// mappings; the returned handle is consumed (closed) by the caller.
+int materialize_file(na_handle_t file, na_handle_t &memory_object) {
+	memory_object = NA_HANDLE_INVALID;
+	if (file == NA_HANDLE_INVALID)
+		return EBADF;
+	naos::system::File::materialize_request request{};
+	call_result result{};
+	const int error = encoded_native_call(
+	    file,
+	    NA_METHOD_FILE_MATERIALIZE,
+	    request,
+	    naos::system::File::encode_materialize_request,
+	    result
+	);
+	if (error != 0) {
+		destroy_result(result);
+		return error;
+	}
+	naos::system::File::materialize_response response{};
+	if (!naos::system::File::decode_materialize_response(result.bytes, result.byte_count, response)
+	    || response.object.value >= result.resource_count) {
+		destroy_result(result);
+		return EIO;
+	}
+	memory_object = result.resources[response.object.value];
+	result.resources[response.object.value] = NA_HANDLE_INVALID;
+	destroy_result(result);
+	return 0;
+}
 
 void reset_after_fork() {
+	// The child inherited the parent's bulk region mapping. Shared pages would
+	// let parent and child overwrite each other's payloads, so drop the child's
+	// copy and let it lazily create its own on the next transfer.
+	if (thread_bulk_region.handle != NA_HANDLE_INVALID) {
+		na_memory_unmap_frame_t frame{};
+		frame.struct_size = sizeof(frame);
+		frame.address = reinterpret_cast<uint64_t>(thread_bulk_region.address);
+		frame.length = thread_bulk_region.size;
+		(void)_na_memory_unmap(&frame);
+		(void)_na_handle_close(thread_bulk_region.handle);
+		thread_bulk_region = {};
+	}
 	fd_slot snapshot[max_fds] = {};
 	na_handle_t original_terminal_handles[max_fds] = {};
 	na_handle_t original_terminal_jobs[max_fds] = {};
 	na_handle_t snapshot_root = NA_HANDLE_INVALID;
 	na_handle_t snapshot_current = NA_HANDLE_INVALID;
 	na_handle_t snapshot_service = NA_HANDLE_INVALID;
-	na_bootstrap_capability_t snapshot_bootstrap_capabilities[NA_BOOTSTRAP_MAX_CAPABILITIES] = {};
-	uint32_t snapshot_bootstrap_capability_count = 0;
 	lock_fds();
+	// Capture the namespace roles while their binding records still exist. The
+	// records are child-local bookkeeping and are cleared below, but the
+	// inherited native handles are the inputs used to obtain fresh bindings.
+	snapshot_root = root_directory();
+	snapshot_current = current_directory();
+	snapshot_service = service_directory;
+	// The child inherited the parent's memory image; binding roles and shared
+	// claims describe the PARENT and are rebuilt from scratch below. Inherited
+	// native handles stay valid as fresh per-process copies.
+	for (auto &binding : directory_bindings)
+		binding = {};
+	root_binding = nullptr;
+	current_binding = nullptr;
+	for (auto &ref : shared_handles)
+		ref = {};
 	for (int fd = 0; fd < max_fds; fd++) {
 		snapshot[fd] = fd_slots[fd];
 		if (snapshot[fd].terminal) {
@@ -414,20 +865,7 @@ void reset_after_fork() {
 			original_terminal_jobs[fd] = snapshot[fd].job_control;
 		}
 	}
-	snapshot_root = root_directory;
-	snapshot_current = current_directory;
-	snapshot_service = service_directory;
-	snapshot_bootstrap_capability_count = bootstrap_capability_count;
-	for (uint32_t i = 0; i < snapshot_bootstrap_capability_count; i++) {
-		snapshot_bootstrap_capabilities[i] = bootstrap_capabilities[i];
-		bootstrap_capabilities[i].handle = NA_HANDLE_INVALID;
-	}
-	bootstrap_capability_count = 0;
 	unlock_fds();
-	for (uint32_t i = 0; i < snapshot_bootstrap_capability_count; i++) {
-		if (snapshot_bootstrap_capabilities[i].handle != NA_HANDLE_INVALID)
-			_na_handle_close(snapshot_bootstrap_capabilities[i].handle);
-	}
 
 	// Fork copies the process resource table, but typed endpoint capabilities
 	// remain single-owner connections. Rebind every unique terminal binding in
@@ -496,22 +934,6 @@ void reset_after_fork() {
 		info.struct_size = sizeof(info);
 		return _na_handle_get_info(handle, &info) == NA_STATUS_OK;
 	};
-	auto is_directory = [&](na_handle_t handle) {
-		na_handle_info_t info{};
-		return inspect(handle, info) && info.binding == NA_BINDING_KERNEL_VIEW
-		       && info.scope == NA_SCOPE_DIRECTORY;
-	};
-	auto is_service_directory = [&](na_handle_t handle) {
-		na_handle_info_t info{};
-		return inspect(handle, info) && info.binding == NA_BINDING_KERNEL_VIEW
-		       && info.scope == NA_SCOPE_SERVICE_DIRECTORY;
-	};
-	auto is_stream = [&](na_handle_t handle) {
-		na_handle_info_t info{};
-		return inspect(handle, info) && info.binding == NA_BINDING_KERNEL_VIEW
-		       && (info.scope == NA_SCOPE_STREAM || info.scope == NA_SCOPE_FILE);
-	};
-
 	bool valid_fd_slots[max_fds] = {};
 	for (int fd = 0; fd < max_fds; fd++) {
 		if (snapshot[fd].handle != NA_HANDLE_INVALID) {
@@ -519,12 +941,13 @@ void reset_after_fork() {
 			valid_fd_slots[fd] = snapshot[fd].terminal || inspect(snapshot[fd].handle, info);
 		}
 	}
-	const bool bootstrap_valid =
-	    is_directory(snapshot_root) && is_directory(snapshot_current)
-	    && is_service_directory(snapshot_service) && valid_fd_slots[STDIN] && valid_fd_slots[STDOUT]
-	    && valid_fd_slots[STDERR] && (is_stream(snapshot[STDIN].handle) || snapshot[STDIN].terminal)
-	    && (is_stream(snapshot[STDOUT].handle) || snapshot[STDOUT].terminal)
-	    && (is_stream(snapshot[STDERR].handle) || snapshot[STDERR].terminal);
+	const bool namespace_handles_present = snapshot_root != NA_HANDLE_INVALID
+	                                       && snapshot_current != NA_HANDLE_INVALID
+	                                       && snapshot_service != NA_HANDLE_INVALID;
+	// The namespace handles are the fork contract.  Stdio may be a terminal
+	// binding whose metadata is intentionally non-duplicable; it is rebound
+	// independently below and must not cause root/cwd to be discarded.
+	const bool bootstrap_valid = namespace_handles_present;
 	const na_handle_t rebound_stdin = snapshot[STDIN].handle;
 	const na_handle_t rebound_stdout = snapshot[STDOUT].handle;
 	const na_handle_t rebound_stderr = snapshot[STDERR].handle;
@@ -542,6 +965,41 @@ void reset_after_fork() {
 			handles[handle_count++] = handle;
 	};
 
+	// Fresh unique Directory endpoints for the child (PRD §5.2: fork/spawn
+	// obtain new endpoints via Directory.clone_binding). Transitional
+	// fallback: keep the inherited KERNEL_VIEW handle when the peer lacks
+	// revision 2 (Phase-3 kernel VFS adapter); Phase 4 deletes the fallback.
+	auto referenced_by_fd = [&](na_handle_t handle) {
+		for (int fd = 0; fd < max_fds; fd++) {
+			if (!snapshot[fd].terminal && snapshot[fd].handle == handle)
+				return true;
+		}
+		return false;
+	};
+	na_handle_t child_root = NA_HANDLE_INVALID;
+	na_handle_t child_current = NA_HANDLE_INVALID;
+	if (bootstrap_valid) {
+		auto rebind_child_directory =
+		    [&](na_handle_t inherited, na_handle_t &child, na_handle_t &drop) {
+			    child = inherited;
+			    drop = NA_HANDLE_INVALID;
+			    if (inherited == NA_HANDLE_INVALID || !directory_supports_revision2())
+				    return;
+			    na_handle_t cloned = NA_HANDLE_INVALID;
+			    if (clone_directory_binding(inherited, cloned) != 0)
+				    return;
+			    child = cloned;
+			    if (!referenced_by_fd(inherited))
+				    drop = inherited;
+		    };
+		na_handle_t drop_root = NA_HANDLE_INVALID;
+		na_handle_t drop_current = NA_HANDLE_INVALID;
+		rebind_child_directory(snapshot_root, child_root, drop_root);
+		rebind_child_directory(snapshot_current, child_current, drop_current);
+		queue_close(drop_root);
+		queue_close(drop_current);
+	}
+
 	lock_fds();
 	for (int fd = 0; fd < max_fds; fd++) {
 		const bool replace_stdio = !bootstrap_valid && fd <= STDERR;
@@ -553,16 +1011,35 @@ void reset_after_fork() {
 			fd_slots[fd] = snapshot[fd];
 	}
 	if (bootstrap_valid) {
-		root_directory = snapshot_root;
-		current_directory = snapshot_current;
 		service_directory = snapshot_service;
 	} else {
 		queue_close(snapshot_root);
 		queue_close(snapshot_current);
 		queue_close(snapshot_service);
-		root_directory = NA_HANDLE_INVALID;
-		current_directory = NA_HANDLE_INVALID;
 		service_directory = NA_HANDLE_INVALID;
+	}
+	// Re-register dup sharing among the child's inherited File/Directory
+	// handles: every slot now owns a fresh copy of its parent handle.
+	if (bootstrap_valid) {
+		for (int fd = 0; fd < max_fds; fd++) {
+			if (snapshot[fd].terminal || snapshot[fd].handle == NA_HANDLE_INVALID)
+				continue;
+			for (int previous = 0; previous < fd; previous++) {
+				if (!snapshot[previous].terminal
+				    && snapshot[previous].handle == snapshot[fd].handle) {
+					shared_retain(snapshot[fd].handle);
+					break;
+				}
+			}
+		}
+		const bool root_shared = child_root == snapshot_root && referenced_by_fd(child_root);
+		const bool current_shared =
+		    child_current == snapshot_current && referenced_by_fd(child_current);
+		root_binding = binding_acquire(child_root, root_shared);
+		current_binding = binding_acquire(child_current, current_shared);
+	} else {
+		root_binding = nullptr;
+		current_binding = nullptr;
 	}
 	bootstrapped = bootstrap_valid;
 	unlock_fds();
@@ -613,6 +1090,11 @@ void close_cloexec() {
 					if (fd_slots[candidate].job_control == job_control)
 						close_job_control = false;
 				}
+			} else {
+				// File/Directory handles may be shared with other descriptors or
+				// the cwd/root bindings; shared_release reports whether the last
+				// runtime owner is going away.
+				close_handle = shared_release(handle);
 			}
 			if (close_handle)
 				queue_close(handle);
@@ -650,6 +1132,8 @@ int status_errno(uint64_t status) {
 			return ENOMEM;
 		case NA_STATUS_FAULT:
 			return EFAULT;
+		case NA_STATUS_IO_ERROR:
+			return EIO;
 		case NA_STATUS_OBJECT_REVOKED:
 			return EIO;
 		case NA_STATUS_PEER_CLOSED:
@@ -691,19 +1175,41 @@ descriptor_kind descriptor_kind_for_handle(na_handle_t handle, bool terminal) {
 	return descriptor_kind::stream;
 }
 
+// PRD §5.2 rule: File and Directory descriptors share the SAME native handle
+// across dup() with runtime reference counting; other scopes (streams) keep
+// their per-descriptor kernel duplicates.
+bool handle_is_sharable_binding(na_handle_t handle) {
+	na_handle_info_t info{};
+	info.struct_size = sizeof(info);
+	if (_na_handle_get_info(handle, &info) != NA_STATUS_OK)
+		return false;
+	return info.scope == NA_SCOPE_FILE || info.scope == NA_SCOPE_DIRECTORY;
+}
+
 int ensure_bootstrap() {
 	if (bootstrapped)
 		return 0;
 	na_bootstrap_frame_t frame{};
 	frame.struct_size = sizeof(frame);
-	const auto status = _na_bootstrap(&frame);
-	if (status != NA_STATUS_OK)
+	auto status = _na_bootstrap(&frame);
+	// Kernel-launched early modules deliberately have no root/cwd in their
+	// first bootstrap. Retry with the explicit flag after the normal
+	// channel-backed request reports NOT_SUPPORTED; ordinary spawned children
+	// still take the normal branch and receive their complete namespace.
+	if (status == NA_STATUS_NOT_SUPPORTED) {
+		frame = {};
+		frame.struct_size = sizeof(frame);
+		frame.flags = NA_BOOTSTRAP_FLAG_EARLY_SERVICE;
+		status = _na_bootstrap(&frame);
+	}
+	if (status != NA_STATUS_OK) {
 		return status_errno(status);
-	if (frame.capability_count > NA_BOOTSTRAP_MAX_CAPABILITIES)
-		return EIO;
-	if (frame.root_directory == NA_HANDLE_INVALID || frame.current_directory == NA_HANDLE_INVALID
-	    || frame.service_directory == NA_HANDLE_INVALID || frame.stdin_stream == NA_HANDLE_INVALID
-	    || frame.stdout_stream == NA_HANDLE_INVALID || frame.stderr_stream == NA_HANDLE_INVALID) {
+	}
+	const bool early_service = frame.flags == NA_BOOTSTRAP_FLAG_EARLY_SERVICE;
+	if (frame.service_directory == NA_HANDLE_INVALID || frame.stdin_stream == NA_HANDLE_INVALID
+	    || frame.stdout_stream == NA_HANDLE_INVALID || frame.stderr_stream == NA_HANDLE_INVALID
+	    || (!early_service && (frame.root_directory == NA_HANDLE_INVALID
+	                           || frame.current_directory == NA_HANDLE_INVALID))) {
 		return EIO;
 	}
 	na_handle_t stdin_job_control = NA_HANDLE_INVALID;
@@ -739,7 +1245,6 @@ int ensure_bootstrap() {
 			_na_handle_close(stdout_job_control);
 		return EIO;
 	}
-
 	lock_fds();
 	auto install_stdio = [](na_handle_t handle, bool write, na_handle_t job_control) {
 		bool master = false;
@@ -757,50 +1262,103 @@ int ensure_bootstrap() {
 	fd_slots[STDIN] = install_stdio(frame.stdin_stream, false, stdin_job_control);
 	fd_slots[STDOUT] = install_stdio(frame.stdout_stream, true, stdout_job_control);
 	fd_slots[STDERR] = install_stdio(frame.stderr_stream, true, stderr_job_control);
-	root_directory = frame.root_directory;
-	current_directory = frame.current_directory;
+	// Runtime-owned bindings (PRD §5.3 item 4): identical bootstrap handles
+	// collapse into one shared binding; otherwise each role owns its endpoint.
+	// Early services install these roles later, after the mount manager has
+	// published the root route.
+	root_binding = early_service ? nullptr : binding_acquire(frame.root_directory, false);
+	current_binding = early_service ? nullptr : binding_acquire(frame.current_directory, false);
 	service_directory = frame.service_directory;
-	bootstrap_capability_count = frame.capability_count;
-	for (uint32_t i = 0; i < bootstrap_capability_count; i++)
-		bootstrap_capabilities[i] = frame.capabilities[i];
 	bootstrapped = true;
 	unlock_fds();
 	return 0;
 }
 
-extern "C" int naos_take_terminal_driver_factory(na_handle_t *handle) {
-	return naos_take_bootstrap_capability(NA_BOOTSTRAP_CAPABILITY_TERMINAL_DRIVER_FACTORY, handle);
-}
-
-extern "C" int naos_take_bootstrap_capability(uint32_t kind, na_handle_t *handle) {
-	if (handle == nullptr)
-		return EFAULT;
+/// Install the mounted root for the kernel-launched init module.
+///
+/// The first Directory endpoint is the vfsd namespace route. `/data` is the
+/// reserved root mountpoint in the current topology; opening it yields the
+/// worker-owned Directory endpoint, which becomes both the libc root and cwd.
+/// The retry is intentionally userland-owned so the kernel never waits on a
+/// filesystem worker or interprets a mount transaction.
+extern "C" int naos_native_install_root_namespace() {
 	const int bootstrap_error = ensure_bootstrap();
 	if (bootstrap_error != 0)
 		return bootstrap_error;
 
-	lock_fds();
-	for (uint32_t i = 0; i < bootstrap_capability_count; i++) {
-		if (bootstrap_capabilities[i].kind != kind)
-			continue;
-		*handle = bootstrap_capabilities[i].handle;
-		for (uint32_t j = i + 1; j < bootstrap_capability_count; j++)
-			bootstrap_capabilities[j - 1] = bootstrap_capabilities[j];
-		bootstrap_capability_count--;
-		bootstrap_capabilities[bootstrap_capability_count] = {};
-		unlock_fds();
-		return 0;
+	constexpr int max_attempts = 300;
+	constexpr na_time_clock_t retry_delay{0, 100000000};
+	for (int attempt = 0; attempt < max_attempts; attempt++) {
+		na_handle_t namespace_root = NA_HANDLE_INVALID;
+		int error = naos_service_connect_versioned(
+		    NAOS_SERVICE_VFS,
+		    &naos::system::Directory::protocol_uuid,
+		    NA_PROTOCOL_RIGHT_INVOKE,
+		    naos::system::Directory::revision,
+		    naos::system::Directory::features,
+		    &namespace_root
+		);
+		if (error == 0) {
+			if (attempt == 0)
+				_s_log("init: root route endpoint acquired\n");
+			const uint8_t mount_path[] = {'/', 'd', 'a', 't', 'a', 0};
+			naos::system::Directory::open_request request{};
+			request.mode = OPEN_MODE_READ;
+			request.flags = 16; // O_DIRECTORY
+			request.path = {mount_path, sizeof(mount_path)};
+			call_result result{};
+			error = encoded_native_call(
+			    namespace_root,
+			    NA_METHOD_DIRECTORY_OPEN,
+			    request,
+			    naos::system::Directory::encode_open_request,
+			    result
+			);
+			if (error == 0) {
+				naos::system::Directory::open_response response{};
+				if (naos::system::Directory::decode_open_response(
+				        result.bytes, result.byte_count, response
+				    )
+				    && response.object.value < result.resource_count) {
+					const na_handle_t mounted_root = result.resources[response.object.value];
+					result.resources[response.object.value] = NA_HANDLE_INVALID;
+					na_handle_info_t info{};
+					info.struct_size = sizeof(info);
+					if (_na_handle_get_info(mounted_root, &info) == NA_STATUS_OK
+					    && info.scope == NA_SCOPE_DIRECTORY) {
+						auto *binding = binding_acquire(mounted_root, false);
+						if (binding != nullptr) {
+							set_root_and_current_binding(binding);
+							destroy_result(result);
+							(void)_na_handle_close(namespace_root);
+							return 0;
+						}
+					}
+					(void)_na_handle_close(mounted_root);
+					error = ENOMEM;
+				}
+			}
+			destroy_result(result);
+			(void)_na_handle_close(namespace_root);
+		}
+		else if (attempt == 0) {
+			_s_log("init: root route service not ready\n");
+		}
+
+		if (error != ENOENT && error != ENODEV && error != EAGAIN && error != EPIPE && error != EIO)
+			return error;
+		if (_s_sleep(&retry_delay) != 0)
+			return EINTR;
 	}
-	unlock_fds();
-	return ENOENT;
+	return ETIMEDOUT;
 }
 
-extern "C" int naos_take_console_frontend(na_handle_t *handle) {
-	return naos_take_bootstrap_capability(NA_BOOTSTRAP_CAPABILITY_CONSOLE_FRONTEND, handle);
+extern "C" int naos_resolve_terminal_driver_factory(na_handle_t *handle) {
+	return naos_service_resolve(NAOS_SERVICE_TERMINAL_DRIVER_FACTORY, handle);
 }
 
-extern "C" int naos_take_input_event_source(na_handle_t *handle) {
-	return naos_take_bootstrap_capability(NA_BOOTSTRAP_CAPABILITY_INPUT_EVENT_SOURCE, handle);
+extern "C" int naos_resolve_input_event_source(na_handle_t *handle) {
+	return naos_service_resolve(NAOS_SERVICE_INPUT_EVENT_SOURCE, handle);
 }
 
 bool valid_fd(int fd) {
@@ -921,6 +1479,10 @@ int close_fd(int fd) {
 			if (fd_slots[candidate].job_control == job_control)
 				close_job_control = false;
 		}
+	} else {
+		// File/Directory handles can be shared with dup'ed descriptors or the
+		// cwd/root bindings; close the native handle only with the last owner.
+		close_handle = shared_release(handle);
 	}
 	unlock_fds();
 	const auto close_status = close_handle ? status_errno(_na_handle_close(handle)) : 0;
@@ -945,34 +1507,62 @@ int duplicate_fd(int fd, int requested_fd, int requested_fd_flags = 0) {
 	const int source_pty_number = fd_slots[fd].pty_number;
 	const auto source_pty_locator = fd_slots[fd].pty_locator;
 	const bool source_has_pty_locator = fd_slots[fd].has_pty_locator;
+	// Classify under the lock: File/Directory descriptors share the native
+	// handle via runtime refcounting; terminals share by convention; other
+	// scopes keep kernel duplicates.
+	const bool source_sharable = !source_terminal && handle_is_sharable_binding(source);
 	unlock_fds();
 
 	na_handle_t duplicate = NA_HANDLE_INVALID;
 	na_handle_t job_duplicate = NA_HANDLE_INVALID;
+	bool shared_handle = false;
 	if (source_terminal) {
 		// POSIX dup shares the same open-description within one process.
 		duplicate = source;
 		job_duplicate = source_job_control;
+	} else if (source_sharable) {
+		lock_fds();
+		shared_handle = shared_retain(source);
+		unlock_fds();
+		if (shared_handle) {
+			duplicate = source;
+		} else {
+			// Transitional safety net: shared-owner table full, fall back to a
+			// per-descriptor kernel duplicate.
+			const auto status = _na_handle_duplicate(source, 0, &duplicate);
+			if (status != NA_STATUS_OK)
+				return -status_errno(status);
+		}
 	} else {
 		const auto status = _na_handle_duplicate(source, 0, &duplicate);
 		if (status != NA_STATUS_OK)
 			return -status_errno(status);
 	}
+	// Release this descriptor's claim on a shared handle (closes only with
+	// the last owner); no-op for terminals.
+	auto discard_duplicate = [&]() {
+		if (shared_handle) {
+			lock_fds();
+			const bool last = shared_release(duplicate);
+			unlock_fds();
+			if (last)
+				_na_handle_close(duplicate);
+		} else if (!source_terminal && duplicate != NA_HANDLE_INVALID) {
+			_na_handle_close(duplicate);
+		}
+	};
 	if (!source_terminal && source_job_control != NA_HANDLE_INVALID) {
 		const auto job_status = _na_handle_duplicate(source_job_control, 0, &job_duplicate);
 		if (job_status != NA_STATUS_OK) {
-			_na_handle_close(duplicate);
+			discard_duplicate();
 			return -status_errno(job_status);
 		}
 	}
 
 	if (requested_fd >= 0) {
 		if (requested_fd >= max_fds || requested_fd == fd) {
-			if (!source_terminal) {
-				_na_handle_close(duplicate);
-				if (job_duplicate != NA_HANDLE_INVALID)
-					_na_handle_close(job_duplicate);
-			}
+			if (!source_terminal)
+				discard_duplicate();
 			return requested_fd == fd ? requested_fd : -EBADF;
 		}
 		lock_fds();
@@ -1003,6 +1593,8 @@ int duplicate_fd(int fd, int requested_fd, int requested_fd_flags = 0) {
 				if (fd_slots[candidate].job_control == old_job)
 					close_old_job = false;
 			}
+		} else {
+			close_old = shared_release(old);
 		}
 		unlock_fds();
 		if (close_old)
@@ -1016,11 +1608,8 @@ int duplicate_fd(int fd, int requested_fd, int requested_fd_flags = 0) {
 	    duplicate, source_flags, requested_fd_flags, source_terminal, source_master, job_duplicate
 	);
 	if (new_fd < 0) {
-		if (!source_terminal) {
-			_na_handle_close(duplicate);
-			if (job_duplicate != NA_HANDLE_INVALID)
-				_na_handle_close(job_duplicate);
-		}
+		if (!source_terminal)
+			discard_duplicate();
 		return -EMFILE;
 	}
 	if (source_terminal) {
@@ -1052,22 +1641,42 @@ int duplicate_fd_min(int fd, int minimum, int new_fd_flags) {
 	const int source_pty_number = fd_slots[fd].pty_number;
 	const auto source_pty_locator = fd_slots[fd].pty_locator;
 	const bool source_has_pty_locator = fd_slots[fd].has_pty_locator;
+	const bool source_sharable = !source_terminal && handle_is_sharable_binding(source);
 	unlock_fds();
 
 	na_handle_t duplicate = NA_HANDLE_INVALID;
 	na_handle_t job_duplicate = NA_HANDLE_INVALID;
+	bool shared_handle = false;
 	if (source_terminal) {
 		duplicate = source;
 		job_duplicate = source_job_control;
-	} else {
+	} else if (source_sharable) {
+		lock_fds();
+		shared_handle = shared_retain(source);
+		unlock_fds();
+		if (shared_handle)
+			duplicate = source;
+	}
+	if (!shared_handle && !source_terminal && duplicate == NA_HANDLE_INVALID) {
 		const auto status = _na_handle_duplicate(source, 0, &duplicate);
 		if (status != NA_STATUS_OK)
 			return -status_errno(status);
 	}
+	auto discard_duplicate = [&]() {
+		if (shared_handle) {
+			lock_fds();
+			const bool last = shared_release(duplicate);
+			unlock_fds();
+			if (last)
+				_na_handle_close(duplicate);
+		} else if (!source_terminal && duplicate != NA_HANDLE_INVALID) {
+			_na_handle_close(duplicate);
+		}
+	};
 	if (!source_terminal && source_job_control != NA_HANDLE_INVALID) {
 		const auto job_status = _na_handle_duplicate(source_job_control, 0, &job_duplicate);
 		if (job_status != NA_STATUS_OK) {
-			_na_handle_close(duplicate);
+			discard_duplicate();
 			return -status_errno(job_status);
 		}
 	}
@@ -1094,11 +1703,7 @@ int duplicate_fd_min(int fd, int minimum, int new_fd_flags) {
 	}
 	unlock_fds();
 	if (new_fd < 0) {
-		if (!source_terminal) {
-			_na_handle_close(duplicate);
-			if (job_duplicate != NA_HANDLE_INVALID)
-				_na_handle_close(job_duplicate);
-		}
+		discard_duplicate();
 		return -EMFILE;
 	}
 	return new_fd;
@@ -1166,7 +1771,7 @@ int service_uri(const char *uri, std::uint32_t &size) {
 	for (std::size_t i = sizeof(prefix) - 1; i < length; i++) {
 		const auto value = static_cast<unsigned char>(uri[i]);
 		if (value == '/') {
-			if (!segment_has_value || segment_is_dot || segment_size == 2)
+			if (!segment_has_value || segment_is_dot)
 				return EINVAL;
 			segment_has_value = false;
 			segment_is_dot = true;
@@ -1182,15 +1787,14 @@ int service_uri(const char *uri, std::uint32_t &size) {
 		if (segment_size > 2 || value != '.')
 			segment_is_dot = false;
 	}
-	if (!segment_has_value || segment_is_dot || segment_size == 2)
+	if (!segment_has_value || segment_is_dot)
 		return EINVAL;
 	size = static_cast<std::uint32_t>(length);
 	return 0;
 }
 
 int wait_service_invocation(na_handle_t invocation, const struct timespec *deadline = nullptr) {
-	na_wait_item_t wait_item{invocation, NA_SIGNAL_COMPLETED | NA_SIGNAL_PEER_CLOSED, 0};
-	const auto status = _na_handle_wait_many(&wait_item, 1, deadline);
+	const auto status = nao::event_loop::wait_invocation(invocation, deadline);
 	if (status == NA_STATUS_WAIT_TIMED_OUT)
 		return ETIMEDOUT;
 	return naos_syscall_error(status);
@@ -1895,75 +2499,66 @@ int terminal_read(const fd_slot &slot, void *buf, std::size_t count, ssize_t *by
 	if (const int error = terminal_check_io(slot, true, false); error != 0)
 		return error;
 	const bool nonblock = (slot.flags & O_NONBLOCK) != 0;
-	const auto wire_capacity = static_cast<std::uint64_t>(NA_CHANNEL_MAX_MESSAGE_BYTES);
-	auto *wire = static_cast<std::uint8_t *>(getAllocator().allocate(wire_capacity));
-	if (wire == nullptr)
-		return ENOMEM;
+	na_resource_disposition_t disposition{};
+	uint64_t window = 0;
+	if (const int error = prepare_bulk_region(count, disposition, window); error != 0)
+		return error;
+	// Request and response are small control messages; the payload travels
+	// through the thread's bulk region.
+	std::uint8_t wire[256];
 	auto transport = make_transport();
 	na_handle_t invocation = NA_HANDLE_INVALID;
 	na_result_frame_t result{};
-	std::uint8_t *data = nullptr;
-	std::uint32_t data_size = 0;
+	std::uint64_t data_size = 0;
 	na_status_t status = NA_STATUS_OK;
 	if (slot.master) {
-		naos::system::TerminalMaster::read_request request{count, nonblock ? 1 : 0};
+		naos::system::TerminalMaster::read_request request{};
+		request.size = count;
+		request.flags = nonblock ? 1 : 0;
+		request.buffer.value = 0;
 		auto client =
 		    naos::system::TerminalMaster::TerminalMasterClient(transport.async(), slot.handle);
-		status = client.submit_read(request, nullptr, 0, &invocation, wire, wire_capacity);
-		if (status != NA_STATUS_OK) {
-			getAllocator().deallocate(wire, wire_capacity);
+		status = client.submit_read(request, &disposition, 1, &invocation, wire, sizeof(wire));
+		if (status != NA_STATUS_OK)
 			return status_errno(status);
-		}
 		int error = wait_service_invocation(invocation);
 		if (error != 0) {
 			_na_handle_close(invocation);
-			getAllocator().deallocate(wire, wire_capacity);
 			return error;
 		}
 		naos::system::TerminalMaster::read_response response{};
-		status = client.take_read(invocation, response, wire, wire_capacity, nullptr, 0, result);
-		data = const_cast<std::uint8_t *>(response.data.data);
-		data_size = response.data.size;
+		status = client.take_read(invocation, response, wire, sizeof(wire), nullptr, 0, result);
+		data_size = response.count;
 	} else {
-		naos::system::TerminalSlave::read_request request{count, nonblock ? 1 : 0};
+		naos::system::TerminalSlave::read_request request{};
+		request.size = count;
+		request.flags = nonblock ? 1 : 0;
+		request.buffer.value = 0;
 		auto client =
 		    naos::system::TerminalSlave::TerminalSlaveClient(transport.async(), slot.handle);
-		status = client.submit_read(request, nullptr, 0, &invocation, wire, wire_capacity);
-		if (status != NA_STATUS_OK) {
-			getAllocator().deallocate(wire, wire_capacity);
+		status = client.submit_read(request, &disposition, 1, &invocation, wire, sizeof(wire));
+		if (status != NA_STATUS_OK)
 			return status_errno(status);
-		}
 		int error = wait_service_invocation(invocation);
 		if (error != 0) {
 			_na_handle_close(invocation);
-			getAllocator().deallocate(wire, wire_capacity);
 			return error;
 		}
 		naos::system::TerminalSlave::read_response response{};
-		status = client.take_read(invocation, response, wire, wire_capacity, nullptr, 0, result);
-		data = const_cast<std::uint8_t *>(response.data.data);
-		data_size = response.data.size;
+		status = client.take_read(invocation, response, wire, sizeof(wire), nullptr, 0, result);
+		data_size = response.count;
 	}
 	_na_handle_close(invocation);
-	if (status != NA_STATUS_OK) {
-		getAllocator().deallocate(wire, wire_capacity);
+	if (status != NA_STATUS_OK)
 		return status_errno(status);
-	}
-	if (result.execution_outcome != NA_EXECUTION_NONE || result.protocol_error != 0) {
-		getAllocator().deallocate(wire, wire_capacity);
+	if (result.execution_outcome != NA_EXECUTION_NONE || result.protocol_error != 0)
 		return result_errno(result);
-	}
-	if (nonblock && data_size == 0) {
-		getAllocator().deallocate(wire, wire_capacity);
+	if (nonblock && data_size == 0)
 		return EAGAIN;
-	}
-	if (data_size > count) {
-		getAllocator().deallocate(wire, wire_capacity);
+	if (data_size > count)
 		return EIO;
-	}
-	memcpy(buf, data, data_size);
+	memcpy(buf, thread_bulk_region.address, data_size);
 	*bytes_read = static_cast<ssize_t>(data_size);
-	getAllocator().deallocate(wire, wire_capacity);
 	return 0;
 }
 
@@ -1982,12 +2577,12 @@ terminal_write(const fd_slot &slot, const void *buf, std::size_t count, ssize_t 
 	if (const int error = terminal_check_io(slot, false, slot.tostop); error != 0)
 		return error;
 	const bool nonblock = (slot.flags & O_NONBLOCK) != 0;
-	if (count > NA_CHANNEL_MAX_MESSAGE_BYTES - 16)
-		return EOVERFLOW;
-	const auto wire_capacity = static_cast<std::uint64_t>(NA_CHANNEL_MAX_MESSAGE_BYTES);
-	auto *wire = static_cast<std::uint8_t *>(getAllocator().allocate(wire_capacity));
-	if (wire == nullptr)
-		return ENOMEM;
+	na_resource_disposition_t disposition{};
+	uint64_t window = 0;
+	if (const int error = prepare_bulk_region(count, disposition, window); error != 0)
+		return error;
+	memcpy(thread_bulk_region.address, buf, count);
+	std::uint8_t wire[256];
 	auto transport = make_transport();
 	na_handle_t invocation = NA_HANDLE_INVALID;
 	na_result_frame_t result{};
@@ -1997,56 +2592,45 @@ terminal_write(const fd_slot &slot, const void *buf, std::size_t count, ssize_t 
 		naos::system::TerminalMaster::write_request request{};
 		request.size = count;
 		request.flags = nonblock ? 1 : 0;
-		request.data = {static_cast<const std::uint8_t *>(buf), static_cast<std::uint32_t>(count)};
+		request.buffer.value = 0;
 		auto client =
 		    naos::system::TerminalMaster::TerminalMasterClient(transport.async(), slot.handle);
-		status = client.submit_write(request, nullptr, 0, &invocation, wire, wire_capacity);
-		if (status != NA_STATUS_OK) {
-			getAllocator().deallocate(wire, wire_capacity);
+		status = client.submit_write(request, &disposition, 1, &invocation, wire, sizeof(wire));
+		if (status != NA_STATUS_OK)
 			return status_errno(status);
-		}
 		int error = wait_service_invocation(invocation);
 		if (error != 0) {
 			_na_handle_close(invocation);
-			getAllocator().deallocate(wire, wire_capacity);
 			return error;
 		}
 		naos::system::TerminalMaster::write_response response{};
-		status = client.take_write(invocation, response, wire, wire_capacity, nullptr, 0, result);
+		status = client.take_write(invocation, response, wire, sizeof(wire), nullptr, 0, result);
 		written = response.count;
 	} else {
 		naos::system::TerminalSlave::write_request request{};
 		request.size = count;
 		request.flags = nonblock ? 1 : 0;
-		request.data = {static_cast<const std::uint8_t *>(buf), static_cast<std::uint32_t>(count)};
+		request.buffer.value = 0;
 		auto client =
 		    naos::system::TerminalSlave::TerminalSlaveClient(transport.async(), slot.handle);
-		status = client.submit_write(request, nullptr, 0, &invocation, wire, wire_capacity);
-		if (status != NA_STATUS_OK) {
-			getAllocator().deallocate(wire, wire_capacity);
+		status = client.submit_write(request, &disposition, 1, &invocation, wire, sizeof(wire));
+		if (status != NA_STATUS_OK)
 			return status_errno(status);
-		}
 		int error = wait_service_invocation(invocation);
 		if (error != 0) {
 			_na_handle_close(invocation);
-			getAllocator().deallocate(wire, wire_capacity);
 			return error;
 		}
 		naos::system::TerminalSlave::write_response response{};
-		status = client.take_write(invocation, response, wire, wire_capacity, nullptr, 0, result);
+		status = client.take_write(invocation, response, wire, sizeof(wire), nullptr, 0, result);
 		written = response.count;
 	}
 	_na_handle_close(invocation);
-	if (status != NA_STATUS_OK) {
-		getAllocator().deallocate(wire, wire_capacity);
+	if (status != NA_STATUS_OK)
 		return status_errno(status);
-	}
-	if (result.execution_outcome != NA_EXECUTION_NONE || result.protocol_error != 0) {
-		getAllocator().deallocate(wire, wire_capacity);
+	if (result.execution_outcome != NA_EXECUTION_NONE || result.protocol_error != 0)
 		return result_errno(result);
-	}
 	*bytes_written = static_cast<ssize_t>(written);
-	getAllocator().deallocate(wire, wire_capacity);
 	return 0;
 }
 
@@ -3022,49 +3606,69 @@ extern "C" int naos_handle_close(na_handle_t handle) {
 	return naos_syscall_error(_na_handle_close(handle));
 }
 
-int native_call(
+int native_call_with_resources(
     na_handle_t target,
     uint64_t method,
     const void *request,
     uint64_t request_bytes,
+    na_resource_disposition_t *dispositions,
+    uint64_t disposition_count,
     call_result &result
 ) {
 	result = {};
 	if (request_bytes > NA_CHANNEL_MAX_MESSAGE_BYTES)
 		return EOVERFLOW;
+	if (const int scratch_error = ensure_result_scratch(); scratch_error != 0)
+		return scratch_error;
 
-	result.bytes = static_cast<uint8_t *>(getAllocator().allocate(result_capacity));
-	if (result.bytes == nullptr) {
-		return ENOMEM;
-	}
 	na_submit_frame_t submit{};
 	submit.struct_size = sizeof(submit);
 	submit.method_id = method;
 	submit.request = reinterpret_cast<uint64_t>(request);
 	submit.request_bytes = request_bytes;
-	submit.resources = 0;
-	submit.resource_count = 0;
-	result.frame = {};
-	result.frame.struct_size = sizeof(result.frame);
-	result.frame.bytes = reinterpret_cast<uint64_t>(result.bytes);
-	result.frame.byte_capacity = result_capacity;
-	result.frame.resources = reinterpret_cast<uint64_t>(result.resources);
-	result.frame.resource_capacity = resource_capacity;
+	submit.resources = reinterpret_cast<uint64_t>(dispositions);
+	submit.resource_count = disposition_count;
 	na_handle_t invocation = NA_HANDLE_INVALID;
 	auto status = _na_invoke_submit(target, &submit, &invocation);
-	if (status != NA_STATUS_OK) {
-		destroy_result(result);
-		return status_errno(status);
+	if (prepared_bulk_view != NA_HANDLE_INVALID) {
+		(void)_na_handle_close(prepared_bulk_view);
+		prepared_bulk_view = NA_HANDLE_INVALID;
 	}
+	if (status != NA_STATUS_OK)
+		return status_errno(status);
 	const int wait_error = wait_service_invocation(invocation);
 	if (wait_error != 0) {
 		(void)_na_invocation_cancel(invocation);
 		(void)_na_handle_close(invocation);
-		destroy_result(result);
 		return wait_error;
 	}
-	status = _na_invocation_take_result(invocation, &result.frame);
+	result.bytes = result_scratch;
+	result.frame.struct_size = sizeof(result.frame);
+	result.frame.bytes = reinterpret_cast<uint64_t>(result_scratch);
+	result.frame.byte_capacity = result_scratch_capacity;
+	result.frame.resources = reinterpret_cast<uint64_t>(result.resources);
+	result.frame.resource_capacity = resource_capacity;
+	// A response that outgrows the thread scratch reports its size through the
+	// frame; the result stays claimable, so grow and retry instead of failing.
+	int claim_error = 0;
+	for (;;) {
+		status = _na_invocation_take_result(invocation, &result.frame);
+		if (status != NA_STATUS_BUFFER_TOO_SMALL
+		    || result.frame.required_bytes <= result_scratch_capacity)
+			break;
+		claim_error =
+		    grow_call_buffer(result_scratch, result_scratch_capacity, result.frame.required_bytes);
+		if (claim_error != 0)
+			break;
+		result.bytes = result_scratch;
+		result.frame.bytes = reinterpret_cast<uint64_t>(result_scratch);
+		result.frame.byte_capacity = result_scratch_capacity;
+	}
 	(void)_na_handle_close(invocation);
+	if (claim_error != 0) {
+		destroy_result(result);
+		return claim_error;
+	}
 	if (status != NA_STATUS_OK) {
 		destroy_result(result);
 		return status_errno(status);
@@ -3079,6 +3683,16 @@ int native_call(
 	return 0;
 }
 
+int native_call(
+    na_handle_t target,
+    uint64_t method,
+    const void *request,
+    uint64_t request_bytes,
+    call_result &result
+) {
+	return native_call_with_resources(target, method, request, request_bytes, nullptr, 0, result);
+}
+
 void destroy_result(call_result &result) {
 	const uint64_t count =
 	    result.resource_count > resource_capacity ? resource_capacity : result.resource_count;
@@ -3086,14 +3700,14 @@ void destroy_result(call_result &result) {
 		if (result.resources[i] != NA_HANDLE_INVALID)
 			_na_handle_close(result.resources[i]);
 	}
-	if (result.bytes != nullptr)
-		getAllocator().deallocate(result.bytes, result_capacity);
+	// The result bytes point into the thread's reusable scratch, which outlives
+	// this call; only the received handles need closing.
 	result = {};
 }
 
 na_handle_t directory_for_fd(int dirfd) {
 	if (dirfd == AT_FDCWD)
-		return current_directory;
+		return current_directory();
 	const auto handle = handle_for_fd(dirfd);
 	if (handle == NA_HANDLE_INVALID)
 		return NA_HANDLE_INVALID;
@@ -3140,66 +3754,6 @@ int open_directory_handle(
 	handle = result.resources[0];
 	result.resources[0] = NA_HANDLE_INVALID;
 	destroy_result(result);
-	return 0;
-}
-
-int update_process_directory(na_handle_t directory, uint64_t method) {
-	if (directory == NA_HANDLE_INVALID)
-		return EBADF;
-	call_result result;
-	int error = 0;
-	if (method == NA_METHOD_DIRECTORY_SET_CURRENT) {
-		naos::system::Directory::set_current_request request{};
-		error = encoded_native_call(
-		    directory, method, request, naos::system::Directory::encode_set_current_request, result
-		);
-	} else {
-		naos::system::Directory::set_root_request request{};
-		error = encoded_native_call(
-		    directory, method, request, naos::system::Directory::encode_set_root_request, result
-		);
-	}
-	if (error != 0)
-		return error;
-	if (result.byte_count != 0 || result.resource_count != 0) {
-		destroy_result(result);
-		return EIO;
-	}
-	destroy_result(result);
-	return 0;
-}
-
-int replace_current_directory(na_handle_t handle) {
-	if (handle == NA_HANDLE_INVALID)
-		return EBADF;
-	lock_fds();
-	const auto old = current_directory;
-	current_directory = handle;
-	unlock_fds();
-	if (old != NA_HANDLE_INVALID)
-		_na_handle_close(old);
-	return 0;
-}
-
-int replace_root_directory(na_handle_t handle) {
-	if (handle == NA_HANDLE_INVALID)
-		return EBADF;
-	na_handle_t root = NA_HANDLE_INVALID;
-	const auto duplicate_status = _na_handle_duplicate(handle, 0, &root);
-	if (duplicate_status != NA_STATUS_OK) {
-		_na_handle_close(handle);
-		return status_errno(duplicate_status);
-	}
-	lock_fds();
-	const auto old_root = root_directory;
-	const auto old_current = current_directory;
-	root_directory = root;
-	current_directory = handle;
-	unlock_fds();
-	if (old_root != NA_HANDLE_INVALID)
-		_na_handle_close(old_root);
-	if (old_current != NA_HANDLE_INVALID)
-		_na_handle_close(old_current);
 	return 0;
 }
 
@@ -3341,7 +3895,7 @@ int open_path_at(na_handle_t directory, const char *path, int flags, mode_t mode
 }
 
 int open_path(const char *path, int flags, mode_t mode, int *fd) {
-	return open_path_at(current_directory, path, flags, mode, fd);
+	return open_path_at(current_directory(), path, flags, mode, fd);
 }
 
 uint64_t count_startup_vector(char *const vector[]) {
@@ -3375,7 +3929,7 @@ int start_process_capability(na_handle_t process) {
 	return 0;
 }
 
-int native_spawn_stdio_with_capabilities(
+int native_spawn_stdio_internal(
     pid_t *pid,
     const char *path,
     char *const argv[],
@@ -3383,63 +3937,38 @@ int native_spawn_stdio_with_capabilities(
     int stdin_fd,
     int stdout_fd,
     int stderr_fd,
-	const na_bootstrap_capability_t *capabilities,
-	uint32_t capability_count,
 	uint64_t service_rights,
 	na_handle_t *deferred_process
 ) {
-	auto close_private_caps = [&] {
-		const uint32_t count = capability_count > NA_BOOTSTRAP_MAX_CAPABILITIES
-		                           ? NA_BOOTSTRAP_MAX_CAPABILITIES
-		                           : capability_count;
-		for (uint32_t i = 0; i < count; i++) {
-			if (capabilities != nullptr && capabilities[i].handle != NA_HANDLE_INVALID)
-				_na_handle_close(capabilities[i].handle);
-		}
-	};
 	if (deferred_process != nullptr)
 		*deferred_process = NA_HANDLE_INVALID;
-	if (pid == nullptr || path == nullptr || capability_count > NA_BOOTSTRAP_MAX_CAPABILITIES ||
-	    (capability_count != 0 && capabilities == nullptr)) {
-		close_private_caps();
+	if (pid == nullptr || path == nullptr) {
 		return EFAULT;
-	}
-	for (uint32_t i = 0; i < capability_count; i++) {
-		if (capabilities[i].kind == 0 || capabilities[i].handle == NA_HANDLE_INVALID) {
-			close_private_caps();
-			return EINVAL;
-		}
-		for (uint32_t j = 0; j < i; j++) {
-			if (capabilities[j].kind == capabilities[i].kind || capabilities[j].handle == capabilities[i].handle) {
-				close_private_caps();
-				return EINVAL;
-			}
-		}
 	}
 	const int bootstrap_error = ensure_bootstrap();
 	if (bootstrap_error != 0) {
-		close_private_caps();
 		return bootstrap_error;
 	}
 
 	int executable_fd = -1;
 	int error = open_path(path, O_RDONLY, 0, &executable_fd);
 	if (error != 0) {
-		close_private_caps();
 		return error;
 	}
 	const auto source = handle_for_fd(executable_fd);
 	na_handle_t executable = NA_HANDLE_INVALID;
-	const auto duplicate_status = _na_handle_duplicate(source, 0, &executable);
+	// File/Directory client ends are unique capabilities. Materialize the
+	// executable as an immutable MemoryObject before Process.spawn so the
+	// child receives a transferable executable capability without relying on
+	// the legacy kernel File duplicate path.
+	const int materialize_error = materialize_file(source, executable);
 	const int close_error = close_fd(executable_fd);
-	if (duplicate_status != NA_STATUS_OK) {
-		close_private_caps();
+	if (materialize_error != 0) {
 		if (close_error != 0)
 			return close_error;
-		return status_errno(duplicate_status);
+		return materialize_error;
 	}
 	if (close_error != 0) {
-		close_private_caps();
 		_na_handle_close(executable);
 		return close_error;
 	}
@@ -3451,7 +3980,6 @@ int native_spawn_stdio_with_capabilities(
 	};
 	if (stdio_handles[0] == NA_HANDLE_INVALID || stdio_handles[1] == NA_HANDLE_INVALID
 	    || stdio_handles[2] == NA_HANDLE_INVALID) {
-		close_private_caps();
 		_na_handle_close(executable);
 		return EBADF;
 	}
@@ -3480,7 +4008,6 @@ int native_spawn_stdio_with_capabilities(
 		          )
 		        : status_errno(_na_handle_duplicate(stdio_handles[i], 0, &stdio_duplicates[i]));
 		if (duplicate_error != 0) {
-			close_private_caps();
 			for (uint32_t j = 0; j < i; j++) {
 				if (stdio_duplicates[j] != NA_HANDLE_INVALID)
 					_na_handle_close(stdio_duplicates[j]);
@@ -3501,7 +4028,6 @@ int native_spawn_stdio_with_capabilities(
 	na_handle_t child_endpoint = NA_HANDLE_INVALID;
 	uint64_t status = _na_channel_create(nullptr, &parent_endpoint, &child_endpoint);
 	if (status != NA_STATUS_OK) {
-		close_private_caps();
 		close_stdio_duplicates();
 		_na_handle_close(executable);
 		return status_errno(status);
@@ -3511,8 +4037,12 @@ int native_spawn_stdio_with_capabilities(
 	uint64_t native_pid = 0;
 	na_process_spawn_frame_t spawn{};
 	spawn.struct_size = sizeof(spawn);
-	if (deferred_process != nullptr)
-		spawn.flags = NA_PROCESS_SPAWN_DEFERRED_START;
+	// Every native spawn is a two-phase transaction.  Starting a child before
+	// its bootstrap message is queued lets it race into std initialization and
+	// makes service startup depend on scheduler timing.  The caller-visible
+	// deferred variant only controls whether the Process capability is returned;
+	// it must not change the kernel handoff ordering.
+	spawn.flags = NA_PROCESS_SPAWN_DEFERRED_START;
 	spawn.executable = executable;
 	spawn.bootstrap_endpoint = child_endpoint;
 	spawn.path = reinterpret_cast<uint64_t>(path);
@@ -3522,7 +4052,6 @@ int native_spawn_stdio_with_capabilities(
 	spawn.pid = reinterpret_cast<uint64_t>(&native_pid);
 	const int64_t spawn_status = _na_process_spawn(&spawn);
 	if (spawn_status != 0) {
-		close_private_caps();
 		close_stdio_duplicates();
 		_na_handle_close(executable);
 		_na_handle_close(child_endpoint);
@@ -3536,7 +4065,6 @@ int native_spawn_stdio_with_capabilities(
 	na_handle_t service_for_child = NA_HANDLE_INVALID;
 	na_handle_t attenuated_service_source = NA_HANDLE_INVALID;
 	if (_na_handle_duplicate(service_directory, 0, &attenuated_service_source) != NA_STATUS_OK) {
-		close_private_caps();
 		_na_handle_close(parent_endpoint);
 		(void)start_process_capability(process);
 		_na_handle_close(process);
@@ -3550,7 +4078,6 @@ int native_spawn_stdio_with_capabilities(
 	restriction.protocol_rights = NA_PROTOCOL_RIGHT_INVOKE | service_rights;
 	if (_na_handle_restrict(attenuated_service_source, &restriction, &service_for_child)
 	    != NA_STATUS_OK) {
-		close_private_caps();
 		_na_handle_close(attenuated_service_source);
 		_na_handle_close(parent_endpoint);
 		(void)start_process_capability(process);
@@ -3559,17 +4086,34 @@ int native_spawn_stdio_with_capabilities(
 		close_stdio_duplicates();
 		return EACCES;
 	}
-
+	// Root/cwd for the child (PRD §5.2/§5.3 item 4): prefer fresh unique
+	// endpoints obtained via Directory.clone_binding, transferred with MOVE
+	// disposition. Transitional fallback: the peer lacks revision 2 (Phase-3
+	// kernel VFS adapter), so send DUPLICATE copies of our own handles as
+	// before; Phase 4 removes this fallback branch.
+	na_handle_t child_root = NA_HANDLE_INVALID;
+	na_handle_t child_current = NA_HANDLE_INVALID;
+	bool move_directories = false;
+	const bool has_directory_revision2 = directory_supports_revision2();
+	if (has_directory_revision2) {
+		const int root_clone_error = clone_directory_binding(root_directory(), child_root);
+		const int current_clone_error =
+		    root_clone_error == 0 ? clone_directory_binding(current_directory(), child_current) : 0;
+		if (root_clone_error == 0 && current_clone_error == 0) {
+			move_directories = true;
+		} else {
+			if (child_root != NA_HANDLE_INVALID)
+				_na_handle_close(child_root);
+			if (child_current != NA_HANDLE_INVALID)
+				_na_handle_close(child_current);
+			child_root = NA_HANDLE_INVALID;
+			child_current = NA_HANDLE_INVALID;
+		}
+	}
 	na_bootstrap_message_t message{};
 	message.struct_size = sizeof(message);
 	message.version = NA_BOOTSTRAP_MESSAGE_VERSION;
-	uint32_t private_resource_count = stdio_resource_count;
-	message.capability_count = capability_count;
-	for (uint32_t i = 0; i < capability_count; i++) {
-		message.capabilities[i].kind = capabilities[i].kind;
-		message.capabilities[i].resource = private_resource_count++;
-	}
-	message.resource_count = private_resource_count;
+	message.resource_count = stdio_resource_count;
 	message.root_directory = NA_BOOTSTRAP_RESOURCE_ROOT_DIRECTORY;
 	message.current_directory = NA_BOOTSTRAP_RESOURCE_CURRENT_DIRECTORY;
 	message.service_directory = NA_BOOTSTRAP_RESOURCE_SERVICE_DIRECTORY;
@@ -3578,22 +4122,31 @@ int native_spawn_stdio_with_capabilities(
 	message.stderr_stream = stdio_resource_indices[2];
 	message.argc = count_startup_vector(argv);
 	message.envc = count_startup_vector(envp);
-	na_resource_disposition_t dispositions[NA_BOOTSTRAP_RESOURCE_COUNT + NA_BOOTSTRAP_MAX_CAPABILITIES]{};
-	na_handle_t resources[NA_BOOTSTRAP_RESOURCE_COUNT + NA_BOOTSTRAP_MAX_CAPABILITIES] = {
-	    root_directory,
-	    current_directory,
+	auto close_cloned_directories = [&]() {
+		if (move_directories) {
+			// Best effort: after a failed channel send the kernel may have
+			// restored or discarded the moved handles; closing an already
+			// consumed handle is a harmless no-op.
+			_na_handle_close(child_root);
+			_na_handle_close(child_current);
+		}
+	};
+	na_resource_disposition_t dispositions[NA_BOOTSTRAP_RESOURCE_COUNT]{};
+	na_handle_t resources[NA_BOOTSTRAP_RESOURCE_COUNT] = {
+	    move_directories ? child_root : root_directory(),
+	    move_directories ? child_current : current_directory(),
 	    service_for_child,
 	};
 	for (uint32_t i = 0; i < 3; i++) {
 		if (stdio_duplicates[i] != NA_HANDLE_INVALID)
 			resources[stdio_resource_indices[i]] = stdio_duplicates[i];
 	}
-	for (uint32_t i = 0; i < capability_count; i++)
-		resources[message.capabilities[i].resource] = capabilities[i].handle;
 	for (uint32_t i = 0; i < message.resource_count; i++) {
 		dispositions[i].handle = resources[i];
 		dispositions[i].operation =
-		    i < NA_BOOTSTRAP_RESOURCE_STDIN ? NA_RESOURCE_DUPLICATE : NA_RESOURCE_MOVE;
+		    i < NA_BOOTSTRAP_RESOURCE_STDIN
+		        ? (move_directories ? NA_RESOURCE_MOVE : NA_RESOURCE_DUPLICATE)
+		        : NA_RESOURCE_MOVE;
 	}
 	na_channel_send_frame send{};
 	send.struct_size = sizeof(send);
@@ -3608,16 +4161,20 @@ int native_spawn_stdio_with_capabilities(
 	if (attenuated_service_source != NA_HANDLE_INVALID)
 		_na_handle_close(attenuated_service_source);
 	if (status != NA_STATUS_OK) {
-		close_private_caps();
+		close_cloned_directories();
 		close_stdio_duplicates();
 		(void)start_process_capability(process);
 		_na_handle_close(process);
 		return status_errno(status);
 	}
-	if (deferred_process != nullptr)
+	if (deferred_process != nullptr) {
 		*deferred_process = process;
-	else
+	} else {
+		const int start_error = start_process_capability(process);
 		_na_handle_close(process);
+		if (start_error != 0)
+			return start_error;
+	}
 	*pid = static_cast<pid_t>(native_pid);
 	return 0;
 }
@@ -3631,18 +4188,8 @@ extern "C" int naos_native_spawn_stdio(
     int stdout_fd,
     int stderr_fd
 ) {
-	return native_spawn_stdio_with_capabilities(
-	    pid,
-	    path,
-	    argv,
-	    envp,
-	    stdin_fd,
-	    stdout_fd,
-	    stderr_fd,
-	    nullptr,
-	    0,
-	    0,
-	    nullptr
+	return native_spawn_stdio_internal(
+	    pid, path, argv, envp, stdin_fd, stdout_fd, stderr_fd, 0, nullptr
 	);
 }
 
@@ -3656,18 +4203,8 @@ extern "C" int naos_native_spawn_stdio_deferred(
     int stdout_fd,
     int stderr_fd
 ) {
-	return native_spawn_stdio_with_capabilities(
-	    pid,
-	    path,
-	    argv,
-	    envp,
-	    stdin_fd,
-	    stdout_fd,
-	    stderr_fd,
-	    nullptr,
-	    0,
-	    0,
-	    process
+	return native_spawn_stdio_internal(
+	    pid, path, argv, envp, stdin_fd, stdout_fd, stderr_fd, 0, process
 	);
 }
 
@@ -3675,64 +4212,11 @@ extern "C" int naos_native_start_process(na_handle_t process) {
 	return start_process_capability(process);
 }
 
-extern "C" int naos_native_spawn_with_terminal_factory(
-    pid_t *pid, const char *path, char *const argv[], char *const envp[], na_handle_t factory_handle
+extern "C" int naos_native_spawn_stdio_with_service_manager(
+	pid_t *pid, const char *path, char *const argv[], char *const envp[]
 ) {
-	const na_bootstrap_capability_t capability = {NA_BOOTSTRAP_CAPABILITY_TERMINAL_DRIVER_FACTORY, factory_handle};
-	return native_spawn_stdio_with_capabilities(
-	    pid,
-	    path,
-	    argv,
-	    envp,
-	    STDIN,
-	    STDOUT,
-	    STDERR,
-	    &capability,
-	    1,
-	    0,
-	    nullptr
-	);
-}
-
-extern "C" int naos_native_spawn_with_terminal_factory_and_service_manager(
-    pid_t *pid, const char *path, char *const argv[], char *const envp[], na_handle_t factory_handle
-) {
-	const na_bootstrap_capability_t capability = {NA_BOOTSTRAP_CAPABILITY_TERMINAL_DRIVER_FACTORY, factory_handle};
-	return native_spawn_stdio_with_capabilities(
-	    pid,
-	    path,
-	    argv,
-	    envp,
-	    STDIN,
-	    STDOUT,
-	    STDERR,
-	    &capability,
-	    1,
-	    NA_SERVICE_DIRECTORY_RIGHT_SYSTEM_MANAGER,
-	    nullptr
-	);
-}
-
-extern "C" int naos_native_spawn_with_capabilities(
-    pid_t *pid,
-    const char *path,
-    char *const argv[],
-    char *const envp[],
-    const na_bootstrap_capability_t *capabilities,
-    uint32_t capability_count
-) {
-	return native_spawn_stdio_with_capabilities(
-	    pid,
-	    path,
-	    argv,
-	    envp,
-	    STDIN,
-	    STDOUT,
-	    STDERR,
-	    capabilities,
-	    capability_count,
-	    0,
-	    nullptr
+	return native_spawn_stdio_internal(
+	    pid, path, argv, envp, STDIN, STDOUT, STDERR, NA_SERVICE_DIRECTORY_RIGHT_SYSTEM_MANAGER, nullptr
 	);
 }
 
@@ -3818,6 +4302,91 @@ int directory_pair_call(
 	return encoded_native_call(
 	    directory, method, request, naos::system::Directory::encode_symlink_request, result
 	);
+}
+
+// Directory revision 2 (PRD §5.3 item 6): atomic rename/link across two
+// dirfds. The new_parent endpoint is transferred with MOVE disposition per
+// the PRD disposition rules: clone_binding produces a temporary copy of the
+// target directory, the clone is MOVE'd into the request, and the caller's
+// original handle is kept throughout. The extra clone RPC per call is an
+// intentionally accepted v1 cost.
+int directory_pair_at_call(
+    na_handle_t old_directory,
+    na_handle_t new_directory,
+    uint64_t method,
+    const char *first,
+    const char *second,
+    uint64_t flags,
+    call_result &result
+) {
+	if (old_directory == NA_HANDLE_INVALID || new_directory == NA_HANDLE_INVALID || first == nullptr
+	    || second == nullptr)
+		return first == nullptr || second == nullptr ? EFAULT : EBADF;
+	const size_t first_length = strlen(first);
+	const size_t second_length = strlen(second);
+	if (first_length >= 4095 || second_length >= 4095)
+		return ENAMETOOLONG;
+
+	na_handle_t new_parent = NA_HANDLE_INVALID;
+	const int clone_error = clone_directory_binding(new_directory, new_parent);
+	if (clone_error != 0)
+		return clone_error;
+
+	na_resource_disposition_t disposition{};
+	disposition.handle = new_parent;
+	disposition.operation = NA_RESOURCE_MOVE;
+	int error;
+	if (method == NA_METHOD_DIRECTORY_RENAME_AT) {
+		naos::system::Directory::rename_at_request request{};
+		request.flags = flags;
+		request.new_parent.value = 0;
+		request.first_size = first_length;
+		request.second_size = second_length;
+		request.first = {
+		    reinterpret_cast<const uint8_t *>(first), static_cast<uint32_t>(first_length)
+		};
+		request.second = {
+		    reinterpret_cast<const uint8_t *>(second), static_cast<uint32_t>(second_length)
+		};
+		error = encoded_native_call_with_resources(
+		    old_directory,
+		    method,
+		    request,
+		    naos::system::Directory::encode_rename_at_request,
+		    &disposition,
+		    1,
+		    result
+		);
+	} else if (method == NA_METHOD_DIRECTORY_LINK_AT) {
+		naos::system::Directory::link_at_request request{};
+		request.flags = flags;
+		request.new_parent.value = 0;
+		request.first_size = first_length;
+		request.second_size = second_length;
+		request.first = {
+		    reinterpret_cast<const uint8_t *>(first), static_cast<uint32_t>(first_length)
+		};
+		request.second = {
+		    reinterpret_cast<const uint8_t *>(second), static_cast<uint32_t>(second_length)
+		};
+		error = encoded_native_call_with_resources(
+		    old_directory,
+		    method,
+		    request,
+		    naos::system::Directory::encode_link_at_request,
+		    &disposition,
+		    1,
+		    result
+		);
+	} else {
+		error = EINVAL;
+	}
+	if (error != 0) {
+		// Best effort: on failure the kernel has either restored or discarded
+		// the moved clone; closing an already consumed handle is a no-op.
+		_na_handle_close(new_parent);
+	}
+	return error;
 }
 
 int directory_readlink_call(na_handle_t directory, const char *path, call_result &result) {
@@ -3935,20 +4504,30 @@ int file_pread_call(na_handle_t file, void *buf, size_t n, off_t offset, ssize_t
 	request.offset = offset;
 	request.size = n;
 	request.flags = 0;
+	na_resource_disposition_t disposition{};
+	const int region_error = attach_bulk_region(request, n, disposition);
+	if (region_error != 0)
+		return region_error;
 	call_result result;
-	const int error = encoded_native_call(
-	    file, NA_METHOD_FILE_PREAD, request, naos::system::File::encode_pread_request, result
+	const int error = encoded_native_call_with_resources(
+	    file,
+	    NA_METHOD_FILE_PREAD,
+	    request,
+	    naos::system::File::encode_pread_request,
+	    &disposition,
+	    1,
+	    result
 	);
 	if (error != 0)
 		return error;
 	naos::system::File::pread_response response{};
 	if (!naos::system::File::decode_pread_response(result.bytes, result.byte_count, response)
-	    || response.data.size > n) {
+	    || response.count > n) {
 		destroy_result(result);
 		return EIO;
 	}
-	memcpy(buf, response.data.data, response.data.size);
-	*bytes_read = static_cast<ssize_t>(response.data.size);
+	memcpy(buf, thread_bulk_region.address, response.count);
+	*bytes_read = static_cast<ssize_t>(response.count);
 	destroy_result(result);
 	return 0;
 }
@@ -3958,16 +4537,24 @@ int file_pwrite_call(
 ) {
 	if (file == NA_HANDLE_INVALID)
 		return EBADF;
-	if (n > NA_CHANNEL_MAX_MESSAGE_BYTES - 24)
-		return EOVERFLOW;
 	naos::system::File::pwrite_request request{};
 	request.offset = offset;
 	request.size = n;
 	request.flags = 0;
-	request.data = {static_cast<const uint8_t *>(buf), static_cast<uint32_t>(n)};
+	na_resource_disposition_t disposition{};
+	const int region_error = attach_bulk_region(request, n, disposition);
+	if (region_error != 0)
+		return region_error;
+	memcpy(thread_bulk_region.address, buf, n);
 	call_result result;
-	const int error = encoded_native_call(
-	    file, NA_METHOD_FILE_PWRITE, request, naos::system::File::encode_pwrite_request, result
+	const int error = encoded_native_call_with_resources(
+	    file,
+	    NA_METHOD_FILE_PWRITE,
+	    request,
+	    naos::system::File::encode_pwrite_request,
+	    &disposition,
+	    1,
+	    result
 	);
 	if (error != 0)
 		return error;
@@ -3985,24 +4572,32 @@ int file_pwrite_call(
 int file_read_call(na_handle_t file, void *buf, size_t n, ssize_t *bytes_read) {
 	if (file == NA_HANDLE_INVALID)
 		return EBADF;
-	if (n > NA_CHANNEL_MAX_MESSAGE_BYTES - 16)
-		return EOVERFLOW;
 	naos::system::File::read_request request{};
 	request.size = n;
+	na_resource_disposition_t disposition{};
+	const int region_error = attach_bulk_region(request, n, disposition);
+	if (region_error != 0)
+		return region_error;
 	call_result result;
-	const int error = encoded_native_call(
-	    file, NA_METHOD_FILE_READ, request, naos::system::File::encode_read_request, result
+	const int error = encoded_native_call_with_resources(
+	    file,
+	    NA_METHOD_FILE_READ,
+	    request,
+	    naos::system::File::encode_read_request,
+	    &disposition,
+	    1,
+	    result
 	);
 	if (error != 0)
 		return error;
 	naos::system::File::read_response response{};
 	if (!naos::system::File::decode_read_response(result.bytes, result.byte_count, response)
-	    || response.data.size > n) {
+	    || response.count > n) {
 		destroy_result(result);
 		return EIO;
 	}
-	memcpy(buf, response.data.data, response.data.size);
-	*bytes_read = static_cast<ssize_t>(response.data.size);
+	memcpy(buf, thread_bulk_region.address, response.count);
+	*bytes_read = static_cast<ssize_t>(response.count);
 	destroy_result(result);
 	return 0;
 }
@@ -4011,16 +4606,24 @@ int
 file_write_call(na_handle_t file, const void *buf, size_t n, int flags, ssize_t *bytes_written) {
 	if (file == NA_HANDLE_INVALID)
 		return EBADF;
-	if (n > NA_CHANNEL_MAX_MESSAGE_BYTES - 16)
-		return EOVERFLOW;
 	naos::system::File::write_request request{};
 	request.size = n;
 	if ((flags & O_NONBLOCK) != 0)
 		request.flags |= NA_IO_FLAG_NONBLOCK;
-	request.data = {static_cast<const uint8_t *>(buf), static_cast<uint32_t>(n)};
+	na_resource_disposition_t disposition{};
+	const int region_error = attach_bulk_region(request, n, disposition);
+	if (region_error != 0)
+		return region_error;
+	memcpy(thread_bulk_region.address, buf, n);
 	call_result result;
-	const int error = encoded_native_call(
-	    file, NA_METHOD_FILE_WRITE, request, naos::system::File::encode_write_request, result
+	const int error = encoded_native_call_with_resources(
+	    file,
+	    NA_METHOD_FILE_WRITE,
+	    request,
+	    naos::system::File::encode_write_request,
+	    &disposition,
+	    1,
+	    result
 	);
 	if (error != 0)
 		return error;
@@ -4046,8 +4649,8 @@ int prepare_iovecs(const struct iovec *iovs, int iovc, Layout &layout, uint64_t 
 	for (int i = 0; i < iovc; i++) {
 		if (iovs[i].iov_len != 0 && iovs[i].iov_base == nullptr)
 			return EFAULT;
-		if (iovs[i].iov_len > NA_CHANNEL_MAX_MESSAGE_BYTES
-		    || total > NA_CHANNEL_MAX_MESSAGE_BYTES - iovs[i].iov_len)
+		if (iovs[i].iov_len > NA_MEMORY_OBJECT_MAX_BYTES
+		    || total > NA_MEMORY_OBJECT_MAX_BYTES - iovs[i].iov_len)
 			return EOVERFLOW;
 		layout.lengths[static_cast<size_t>(i)] = iovs[i].iov_len;
 		total += iovs[i].iov_len;
@@ -4057,11 +4660,29 @@ int prepare_iovecs(const struct iovec *iovs, int iovc, Layout &layout, uint64_t 
 	return 0;
 }
 
+// Bulk payloads live in the thread region; a bounded view lets the existing
+// scatter helper consume them exactly as it consumed the inline response bytes.
+naoidl::bounded_bytes bulk_region_view(uint64_t count) {
+	return naoidl::bounded_bytes{
+	    thread_bulk_region.address, static_cast<uint32_t>(count)
+	};
+}
+
+void gather_iovecs(uint8_t *destination, const struct iovec *iovs, int iovc) {
+	size_t cursor = 0;
+	for (int i = 0; i < iovc; i++) {
+		if (iovs[i].iov_len != 0) {
+			memcpy(destination + cursor, iovs[i].iov_base, iovs[i].iov_len);
+			cursor += iovs[i].iov_len;
+		}
+	}
+}
+
 template <typename BoundedBytes>
 int scatter_iovecs(const BoundedBytes &data, const struct iovec *iovs, int iovc, ssize_t *bytes) {
 	if (bytes == nullptr || iovc < 0 || (iovc != 0 && iovs == nullptr))
 		return EFAULT;
-	if (data.size > NA_CHANNEL_MAX_MESSAGE_BYTES)
+	if (data.size > NA_MEMORY_OBJECT_MAX_BYTES)
 		return EIO;
 	size_t capacity = 0;
 	for (int i = 0; i < iovc; i++) {
@@ -4099,40 +4720,61 @@ int file_readv_call(
 	int error = prepare_iovecs(iovs, iovc, layout, total);
 	if (error != 0)
 		return error;
+	na_resource_disposition_t disposition{};
 	call_result result{};
 	if (positioned) {
 		naos::system::File::preadv_request request{};
 		request.offset = offset;
 		request.layout = layout;
 		request.size = total;
-		error = encoded_native_call(
-		    file, NA_METHOD_FILE_PREADV, request, naos::system::File::encode_preadv_request, result
+		error = attach_bulk_region(request, total, disposition);
+		if (error != 0)
+			return error;
+		error = encoded_native_call_with_resources(
+		    file,
+		    NA_METHOD_FILE_PREADV,
+		    request,
+		    naos::system::File::encode_preadv_request,
+		    &disposition,
+		    1,
+		    result
 		);
 		if (error != 0)
 			return error;
 		naos::system::File::preadv_response response{};
 		if (!naos::system::File::decode_preadv_response(
 		        result.bytes, result.byte_count, response
-		    )) {
+		    )
+		    || response.count > total) {
 			destroy_result(result);
 			return EIO;
 		}
-		error = scatter_iovecs(response.data, iovs, iovc, bytes_read);
+		error = scatter_iovecs(bulk_region_view(response.count), iovs, iovc, bytes_read);
 	} else {
 		naos::system::File::readv_request request{};
 		request.layout = layout;
 		request.size = total;
-		error = encoded_native_call(
-		    file, NA_METHOD_FILE_READV, request, naos::system::File::encode_readv_request, result
+		error = attach_bulk_region(request, total, disposition);
+		if (error != 0)
+			return error;
+		error = encoded_native_call_with_resources(
+		    file,
+		    NA_METHOD_FILE_READV,
+		    request,
+		    naos::system::File::encode_readv_request,
+		    &disposition,
+		    1,
+		    result
 		);
 		if (error != 0)
 			return error;
 		naos::system::File::readv_response response{};
-		if (!naos::system::File::decode_readv_response(result.bytes, result.byte_count, response)) {
+		if (!naos::system::File::decode_readv_response(result.bytes, result.byte_count, response)
+		    || response.count > total) {
 			destroy_result(result);
 			return EIO;
 		}
-		error = scatter_iovecs(response.data, iovs, iovc, bytes_read);
+		error = scatter_iovecs(bulk_region_view(response.count), iovs, iovc, bytes_read);
 	}
 	destroy_result(result);
 	return error;
@@ -4154,19 +4796,7 @@ int file_writev_call(
 	int error = prepare_iovecs(iovs, iovc, layout, total);
 	if (error != 0)
 		return error;
-	uint8_t *packed = nullptr;
-	if (total != 0) {
-		packed = static_cast<uint8_t *>(getAllocator().allocate(total));
-		if (packed == nullptr)
-			return ENOMEM;
-		size_t cursor = 0;
-		for (int i = 0; i < iovc; i++) {
-			if (iovs[i].iov_len != 0) {
-				memcpy(packed + cursor, iovs[i].iov_base, iovs[i].iov_len);
-				cursor += iovs[i].iov_len;
-			}
-		}
-	}
+	na_resource_disposition_t disposition{};
 	call_result result{};
 	if (positioned) {
 		naos::system::File::pwritev_request request{};
@@ -4174,12 +4804,17 @@ int file_writev_call(
 		request.layout = layout;
 		request.size = total;
 		request.flags = (flags & O_NONBLOCK) != 0 ? NA_IO_FLAG_NONBLOCK : 0;
-		request.data = {packed, static_cast<uint32_t>(total)};
-		error = encoded_native_call(
+		error = attach_bulk_region(request, total, disposition);
+		if (error != 0)
+			return error;
+		gather_iovecs(thread_bulk_region.address, iovs, iovc);
+		error = encoded_native_call_with_resources(
 		    file,
 		    NA_METHOD_FILE_PWRITEV,
 		    request,
 		    naos::system::File::encode_pwritev_request,
+		    &disposition,
+		    1,
 		    result
 		);
 		if (error == 0) {
@@ -4197,9 +4832,18 @@ int file_writev_call(
 		request.layout = layout;
 		request.size = total;
 		request.flags = (flags & O_NONBLOCK) != 0 ? NA_IO_FLAG_NONBLOCK : 0;
-		request.data = {packed, static_cast<uint32_t>(total)};
-		error = encoded_native_call(
-		    file, NA_METHOD_FILE_WRITEV, request, naos::system::File::encode_writev_request, result
+		error = attach_bulk_region(request, total, disposition);
+		if (error != 0)
+			return error;
+		gather_iovecs(thread_bulk_region.address, iovs, iovc);
+		error = encoded_native_call_with_resources(
+		    file,
+		    NA_METHOD_FILE_WRITEV,
+		    request,
+		    naos::system::File::encode_writev_request,
+		    &disposition,
+		    1,
+		    result
 		);
 		if (error == 0) {
 			naos::system::File::writev_response response{};
@@ -4212,8 +4856,6 @@ int file_writev_call(
 				*bytes_written = static_cast<ssize_t>(response.count);
 		}
 	}
-	if (packed != nullptr)
-		getAllocator().deallocate(packed, total);
 	destroy_result(result);
 	return error;
 }
@@ -4232,16 +4874,27 @@ int stream_readv_call(
 	request.layout = layout;
 	request.size = total;
 	request.flags = (flags & O_NONBLOCK) != 0 ? NA_IO_FLAG_NONBLOCK : 0;
+	na_resource_disposition_t disposition{};
+	error = attach_bulk_region(request, total, disposition);
+	if (error != 0)
+		return error;
 	call_result result{};
-	error = encoded_native_call(
-	    stream, NA_METHOD_STREAM_READV, request, naos::system::Stream::encode_readv_request, result
+	error = encoded_native_call_with_resources(
+	    stream,
+	    NA_METHOD_STREAM_READV,
+	    request,
+	    naos::system::Stream::encode_readv_request,
+	    &disposition,
+	    1,
+	    result
 	);
 	if (error == 0) {
 		naos::system::Stream::readv_response response{};
-		if (!naos::system::Stream::decode_readv_response(result.bytes, result.byte_count, response))
+		if (!naos::system::Stream::decode_readv_response(result.bytes, result.byte_count, response)
+		    || response.count > total)
 			error = EIO;
 		else
-			error = scatter_iovecs(response.data, iovs, iovc, bytes_read);
+			error = scatter_iovecs(bulk_region_view(response.count), iovs, iovc, bytes_read);
 	}
 	destroy_result(result);
 	return error;
@@ -4257,30 +4910,23 @@ int stream_writev_call(
 	int error = prepare_iovecs(iovs, iovc, layout, total);
 	if (error != 0)
 		return error;
-	uint8_t *packed = nullptr;
-	if (total != 0) {
-		packed = static_cast<uint8_t *>(getAllocator().allocate(total));
-		if (packed == nullptr)
-			return ENOMEM;
-		size_t cursor = 0;
-		for (int i = 0; i < iovc; i++) {
-			if (iovs[i].iov_len != 0) {
-				memcpy(packed + cursor, iovs[i].iov_base, iovs[i].iov_len);
-				cursor += iovs[i].iov_len;
-			}
-		}
-	}
 	naos::system::Stream::writev_request request{};
 	request.layout = layout;
 	request.size = total;
 	request.flags = (flags & O_NONBLOCK) != 0 ? NA_IO_FLAG_NONBLOCK : 0;
-	request.data = {packed, static_cast<uint32_t>(total)};
+	na_resource_disposition_t disposition{};
+	error = attach_bulk_region(request, total, disposition);
+	if (error != 0)
+		return error;
+	gather_iovecs(thread_bulk_region.address, iovs, iovc);
 	call_result result{};
-	error = encoded_native_call(
+	error = encoded_native_call_with_resources(
 	    stream,
 	    NA_METHOD_STREAM_WRITEV,
 	    request,
 	    naos::system::Stream::encode_writev_request,
+	    &disposition,
+	    1,
 	    result
 	);
 	if (error == 0) {
@@ -4291,8 +4937,6 @@ int stream_writev_call(
 		else
 			*bytes_written = static_cast<ssize_t>(response.count);
 	}
-	if (packed != nullptr)
-		getAllocator().deallocate(packed, total);
 	destroy_result(result);
 	return error;
 }
@@ -4344,6 +4988,9 @@ int Sysdeps<ClockGet>::operator()(int clock, time_t *secs, long *nanos) {
 	*secs = c.tv_sec;
 	*nanos = c.tv_nsec;
 	return 0;
+}
+int Sysdeps<GetEntropy>::operator()(void *buffer, size_t length) {
+	return naos_syscall_error(_s_getrandom(buffer, length, 0));
 }
 
 int Sysdeps<TcbSet>::operator()(void *pointer) { return naos_syscall_error(_s_tcb_set(pointer)); }
@@ -4445,20 +5092,30 @@ int Sysdeps<Read>::operator()(int fd, void *buf, size_t count, ssize_t *bytes_re
 	request.size = count;
 	if ((slot.flags & O_NONBLOCK) != 0)
 		request.flags = RWFLAGS_NO_BLOCK;
+	na_resource_disposition_t disposition{};
+	error = naos_native::attach_bulk_region(request, count, disposition);
+	if (error != 0)
+		return error;
 	naos_native::call_result result;
-	error = naos_native::encoded_native_call(
-	    handle, NA_METHOD_STREAM_READ, request, naos::system::Stream::encode_read_request, result
+	error = naos_native::encoded_native_call_with_resources(
+	    handle,
+	    NA_METHOD_STREAM_READ,
+	    request,
+	    naos::system::Stream::encode_read_request,
+	    &disposition,
+	    1,
+	    result
 	);
 	if (error != 0)
 		return error;
 	naos::system::Stream::read_response response{};
 	if (!naos::system::Stream::decode_read_response(result.bytes, result.byte_count, response)
-	    || response.data.size > count) {
+	    || response.count > count) {
 		naos_native::destroy_result(result);
 		return EIO;
 	}
-	memcpy(buf, response.data.data, response.data.size);
-	*bytes_read = static_cast<ssize_t>(response.data.size);
+	memcpy(buf, naos_native::thread_bulk_region.address, response.count);
+	*bytes_read = static_cast<ssize_t>(response.count);
 	naos_native::destroy_result(result);
 	return 0;
 }
@@ -4516,23 +5173,32 @@ int Sysdeps<Write>::operator()(int fd, const void *buf, size_t count, ssize_t *b
 	const auto handle = slot.handle;
 	if (slot.kind == naos_native::descriptor_kind::file)
 		return naos_native::file_write_call(handle, buf, count, slot.flags, bytes_written);
-	if (count > NA_CHANNEL_MAX_MESSAGE_BYTES - 16)
-		return EOVERFLOW;
 	naos::system::Stream::write_request request{};
 	request.size = count;
 	uint64_t flags = 0;
 	if ((slot.flags & O_NONBLOCK) != 0)
 		flags |= RWFLAGS_NO_BLOCK;
 	request.flags = flags;
-	request.data = {static_cast<const uint8_t *>(buf), static_cast<uint32_t>(count)};
+	na_resource_disposition_t disposition{};
+	error = naos_native::attach_bulk_region(request, count, disposition);
+	if (error != 0)
+		return error;
+	memcpy(naos_native::thread_bulk_region.address, buf, count);
 	naos_native::call_result result;
-	error = naos_native::encoded_native_call(
-	    handle, NA_METHOD_STREAM_WRITE, request, naos::system::Stream::encode_write_request, result
+	error = naos_native::encoded_native_call_with_resources(
+	    handle,
+	    NA_METHOD_STREAM_WRITE,
+	    request,
+	    naos::system::Stream::encode_write_request,
+	    &disposition,
+	    1,
+	    result
 	);
 	if (error != 0)
 		return error;
 	naos::system::Stream::write_response response{};
-	if (!naos::system::Stream::decode_write_response(result.bytes, result.byte_count, response)) {
+	if (!naos::system::Stream::decode_write_response(result.bytes, result.byte_count, response)
+	    || response.count > count) {
 		naos_native::destroy_result(result);
 		return EIO;
 	}
@@ -4681,8 +5347,8 @@ int Sysdeps<Ioctl>::operator()(int fd, unsigned long request, void *argument, in
 	}
 
 	if (slot.terminal) {
-		const bool set_tostop = (request == TCSETS || request == TCSETSW || request == TCSETSF)
-		                        && argument != nullptr;
+		const bool set_tostop =
+		    (request == TCSETS || request == TCSETSW || request == TCSETSF) && argument != nullptr;
 		const bool tostop =
 		    set_tostop && (static_cast<const struct termios *>(argument)->c_lflag & TOSTOP) != 0;
 		const int ioctl_error = naos_native::terminal_ioctl(slot, request, argument, result);
@@ -4706,15 +5372,23 @@ int Sysdeps<Ioctl>::operator()(int fd, unsigned long request, void *argument, in
 	if (request == FBIOGET_FSCREENINFO || request == FBIOGET_VSCREENINFO) {
 		if (argument == nullptr)
 			return EFAULT;
+		const auto expected =
+		    request == FBIOGET_FSCREENINFO ? sizeof(fb_fix_screeninfo) : sizeof(fb_var_screeninfo);
 		naos::system::File::device_control_request encoded_request{};
 		encoded_request.request = request;
 		encoded_request.argument_size = 0;
+		na_resource_disposition_t disposition{};
+		error = naos_native::attach_bulk_region(encoded_request, expected, disposition);
+		if (error != 0)
+			return error;
 		naos_native::call_result call;
-		error = naos_native::encoded_native_call(
+		error = naos_native::encoded_native_call_with_resources(
 		    stream,
 		    NA_METHOD_FILE_DEVICE_CONTROL,
 		    encoded_request,
 		    naos::system::File::encode_device_control_request,
+		    &disposition,
+		    1,
 		    call
 		);
 		if (error != 0)
@@ -4722,16 +5396,12 @@ int Sysdeps<Ioctl>::operator()(int fd, unsigned long request, void *argument, in
 		naos::system::File::device_control_response response{};
 		if (!naos::system::File::decode_device_control_response(
 		        call.bytes, call.byte_count, response
-		    )) {
+		    )
+		    || response.result_size < expected) {
 			naos_native::destroy_result(call);
 			return EIO;
 		}
-		const auto expected = request == FBIOGET_FSCREENINFO ? sizeof(fb_fix_screeninfo) : sizeof(fb_var_screeninfo);
-		if (response.result.size < expected) {
-			naos_native::destroy_result(call);
-			return EIO;
-		}
-		memcpy(argument, response.result.data, expected);
+		memcpy(argument, naos_native::thread_bulk_region.address, expected);
 		naos_native::destroy_result(call);
 		if (result != nullptr)
 			*result = 0;
@@ -5127,8 +5797,25 @@ retry_terminal_watch:
 			return ENOMEM;
 		memset(terminal_entries, 0, sizeof(terminal_poll_entry) * static_cast<std::size_t>(count));
 	}
-	na_wait_item_t wait_items[1024] = {};
+	na_handle_t wait_handles[1024] = {};
+	na_epoll_event_t wait_registrations[1024] = {};
+	na_epoll_event_t returned_events[1024] = {};
 	uint64_t wait_count = 0;
+	auto append_wait = [&](na_handle_t handle, uint64_t events) {
+		if (handle == NA_HANDLE_INVALID || events == 0)
+			return;
+		for (uint64_t index = 0; index < wait_count; index++) {
+			if (wait_handles[index] == handle) {
+				wait_registrations[index].events |= events;
+				return;
+			}
+		}
+		if (wait_count < 1024) {
+			wait_handles[wait_count] = handle;
+			wait_registrations[wait_count] = {events, wait_count};
+			wait_count++;
+		}
+	};
 	int ready = 0;
 	struct timespec query_deadline{};
 	const struct timespec *query_deadline_ptr = nullptr;
@@ -5164,7 +5851,12 @@ retry_terminal_watch:
 				signals |= NA_SIGNAL_READABLE;
 			if ((fds[i].events & POLLOUT) != 0)
 				signals |= NA_SIGNAL_WRITABLE;
-			wait_items[wait_count++] = {slot.handle, signals, info.signals};
+			uint64_t event_mask = NA_EPOLL_EVENT_HANGUP;
+			if ((fds[i].events & (POLLIN | POLLPRI)) != 0)
+				event_mask |= NA_EPOLL_EVENT_READABLE;
+			if ((fds[i].events & POLLOUT) != 0)
+				event_mask |= NA_EPOLL_EVENT_WRITABLE;
+			append_wait(slot.handle, event_mask);
 			if ((info.signals & signals) != 0) {
 				if ((info.signals & NA_SIGNAL_READABLE) != 0
 				    && (fds[i].events & (POLLIN | POLLPRI)) != 0)
@@ -5186,8 +5878,9 @@ retry_terminal_watch:
 			mask |= terminal_writable_bit;
 		uint32_t initial_revents = 0;
 		uint64_t generation = 0;
-		const int query_error =
-		    terminal_query(slot, mask, fds[i].events, initial_revents, generation, query_deadline_ptr);
+		const int query_error = terminal_query(
+		    slot, mask, fds[i].events, initial_revents, generation, query_deadline_ptr
+		);
 		if (query_error == ETIMEDOUT) {
 			// The terminal service did not answer within the poll deadline.
 			// Report no readiness for this descriptor instead of blocking
@@ -5223,16 +5916,37 @@ retry_terminal_watch:
 			ready++;
 			continue;
 		}
-		wait_items[wait_count++] = {
-		    terminal_entries[i].invocation, NA_SIGNAL_COMPLETED | NA_SIGNAL_PEER_CLOSED, 0
-		};
+		append_wait(terminal_entries[i].invocation, NA_EPOLL_EVENT_READABLE | NA_EPOLL_EVENT_HANGUP);
 	}
+
+	auto wait_registered = [&](const struct timespec *deadline) -> na_status_t {
+		if (wait_count == 0)
+			return NA_STATUS_OK;
+		na_handle_t epoll = NA_HANDLE_INVALID;
+		na_status_t status = nao::event_loop::create(epoll);
+		if (status == NA_STATUS_OK) {
+			for (uint64_t index = 0; index < wait_count; index++) {
+				status = nao::event_loop::control(
+				    epoll, NA_EPOLL_CTL_ADD, wait_handles[index], &wait_registrations[index]
+				);
+				if (status != NA_STATUS_OK)
+					break;
+			}
+		}
+		if (status == NA_STATUS_OK) {
+			uint64_t actual = 0;
+			status = nao::event_loop::wait(epoll, returned_events, wait_count, actual, deadline);
+		}
+		if (epoll != NA_HANDLE_INVALID)
+			(void)_na_handle_close(epoll);
+		return status;
+	};
 
 	bool retry_terminal_watch = false;
 	if (ready == 0 && (wait_count != 0 || timeout != 0)) {
 		if (timeout < 0) {
 			if (wait_count != 0) {
-				const auto status = _na_handle_wait_many(wait_items, wait_count, nullptr);
+				const auto status = wait_registered(nullptr);
 				if (status != NA_STATUS_OK && status != NA_STATUS_WAIT_TIMED_OUT) {
 					for (nfds_t i = 0; i < count; i++)
 						terminal_cancel_and_close(terminal_entries[i]);
@@ -5284,7 +5998,7 @@ retry_terminal_watch:
 					struct timespec deadline{};
 					deadline.tv_sec = static_cast<time_t>(deadline_us / 1000000);
 					deadline.tv_nsec = static_cast<long>((deadline_us % 1000000) * 1000);
-					const auto status = _na_handle_wait_many(wait_items, wait_count, &deadline);
+					const auto status = wait_registered(&deadline);
 					if (status != NA_STATUS_OK && status != NA_STATUS_WAIT_TIMED_OUT) {
 						for (nfds_t i = 0; i < count; i++)
 							terminal_cancel_and_close(terminal_entries[i]);
@@ -5394,6 +6108,101 @@ retry_terminal_watch:
 	return 0;
 }
 
+int Sysdeps<Pselect>::operator()(
+	int num_fds, fd_set *read_set, fd_set *write_set, fd_set *except_set,
+	const struct timespec *timeout, const sigset_t *sigmask, int *num_events
+) {
+	if (num_fds < 0 || num_fds > FD_SETSIZE || num_events == nullptr)
+		return EINVAL;
+	if (timeout != nullptr && (timeout->tv_sec < 0 || timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000L))
+		return EINVAL;
+
+	// NaOS currently has no signal-mask trampoline. Polling the descriptors is
+	// still useful and preserves the readiness/timeout contract; the mask is
+	// intentionally ignored until the signal ABI can apply it atomically.
+	(void)sigmask;
+
+	int timeout_ms = -1;
+	if (timeout != nullptr) {
+		const uint64_t seconds = static_cast<uint64_t>(timeout->tv_sec);
+		const uint64_t milliseconds = static_cast<uint64_t>((timeout->tv_nsec + 999999L) / 1000000L);
+		if (seconds > static_cast<uint64_t>(INT_MAX) / 1000 ||
+			seconds * 1000 > static_cast<uint64_t>(INT_MAX) - milliseconds) {
+			timeout_ms = INT_MAX;
+		} else {
+			timeout_ms = static_cast<int>(seconds * 1000 + milliseconds);
+		}
+	}
+
+	struct pollfd *pollfds = nullptr;
+	if (num_fds != 0) {
+		pollfds = static_cast<struct pollfd *>(
+			getAllocator().allocate(sizeof(struct pollfd) * static_cast<std::size_t>(num_fds))
+		);
+		if (pollfds == nullptr)
+			return ENOMEM;
+	}
+	for (int fd = 0; fd < num_fds; fd++) {
+		short events = 0;
+		if (read_set != nullptr && FD_ISSET(fd, read_set))
+			events |= POLLIN;
+		if (write_set != nullptr && FD_ISSET(fd, write_set))
+			events |= POLLOUT;
+		if (except_set != nullptr && FD_ISSET(fd, except_set))
+			events |= POLLPRI;
+		pollfds[fd] = {fd, events, 0};
+	}
+
+	int poll_events = 0;
+	const int error = Sysdeps<Poll>{}(
+		pollfds, static_cast<nfds_t>(num_fds), timeout_ms, &poll_events
+	);
+	if (error != 0) {
+		if (pollfds != nullptr)
+			getAllocator().deallocate(pollfds, sizeof(struct pollfd) * static_cast<std::size_t>(num_fds));
+		return error;
+	}
+
+	if (read_set != nullptr)
+		FD_ZERO(read_set);
+	if (write_set != nullptr)
+		FD_ZERO(write_set);
+	if (except_set != nullptr)
+		FD_ZERO(except_set);
+
+	int ready = 0;
+	for (int fd = 0; fd < num_fds; fd++) {
+		const short revents = pollfds[fd].revents;
+		if ((revents & POLLNVAL) != 0) {
+			if (pollfds != nullptr)
+				getAllocator().deallocate(pollfds, sizeof(struct pollfd) * static_cast<std::size_t>(num_fds));
+			return EBADF;
+		}
+		bool selected = false;
+		if (read_set != nullptr && (revents & (POLLIN | POLLHUP | POLLERR)) != 0
+			&& (pollfds[fd].events & POLLIN) != 0) {
+			FD_SET(fd, read_set);
+			selected = true;
+		}
+		if (write_set != nullptr && (revents & (POLLOUT | POLLHUP | POLLERR)) != 0
+			&& (pollfds[fd].events & POLLOUT) != 0) {
+			FD_SET(fd, write_set);
+			selected = true;
+		}
+		if (except_set != nullptr && (revents & POLLPRI) != 0
+			&& (pollfds[fd].events & POLLPRI) != 0) {
+			FD_SET(fd, except_set);
+			selected = true;
+		}
+		if (selected)
+			ready++;
+	}
+	if (pollfds != nullptr)
+		getAllocator().deallocate(pollfds, sizeof(struct pollfd) * static_cast<std::size_t>(num_fds));
+	*num_events = ready;
+	return 0;
+}
+
 // mlibc assumes that anonymous memory returned by sys_vm_map() is zeroed by the kernel / whatever
 // is behind the sysdeps
 int Sysdeps<VmMap>::operator()(
@@ -5419,14 +6228,52 @@ int Sysdeps<VmMap>::operator()(
 	frame.flags = mmap_flags;
 	frame.hint = reinterpret_cast<uint64_t>(hint);
 	frame.object = NA_HANDLE_INVALID;
+	na_handle_t materialized_object = NA_HANDLE_INVALID;
 	if (!(flags & MAP_ANONYMOUS)) {
 		frame.object = naos_native::handle_for_fd(fd);
 		if (frame.object == NA_HANDLE_INVALID)
 			return EBADF;
+		// MAP_PRIVATE regular-file mapping (PRD §5.4): materialize an
+		// immutable snapshot via File.materialize (revision 4) and map the
+		// returned MemoryObject instead of taking the kernel VFS file-mapping
+		// path. MAP_SHARED and anonymous mappings are untouched.
+		if (!(flags & MAP_SHARED)
+		    && naos_native::file_materialize_state
+		           != naos_native::file_materialize_support::unavailable) {
+			na_handle_info_t info{};
+			info.struct_size = sizeof(info);
+			if (_na_handle_get_info(frame.object, &info) == NA_STATUS_OK
+			    && info.scope == NA_SCOPE_FILE) {
+				const int materialize_error =
+				    naos_native::materialize_file(frame.object, materialized_object);
+				if (materialize_error == 0) {
+					frame.object = materialized_object;
+					naos_native::file_materialize_state =
+					    naos_native::file_materialize_support::available;
+				} else if (materialize_error == ENOTSUP || materialize_error == EPROTO) {
+					// Transitional fallback: the peer does not implement
+					// materialize (Phase-3 kernel VFS adapter); remember it and
+					// use the legacy in-kernel file mapping below.
+					naos_native::file_materialize_state =
+					    naos_native::file_materialize_support::unavailable;
+				} else if (
+				    naos_native::file_materialize_state
+				    == naos_native::file_materialize_support::unknown
+				) {
+					// Unknown support and a non-support error: retry the probe
+					// on the next mapping rather than mis-reporting a failure.
+					materialized_object = NA_HANDLE_INVALID;
+				} else {
+					return materialize_error;
+				}
+			}
+		}
 	}
 	frame.offset = offset;
 	frame.length = size;
 	const auto status = _na_memory_map(&frame);
+	if (materialized_object != NA_HANDLE_INVALID)
+		_na_handle_close(materialized_object);
 	if (status != NA_STATUS_OK)
 		return naos_native::status_errno(status);
 	*window = reinterpret_cast<void *>(frame.address);
@@ -5493,7 +6340,7 @@ int Sysdeps<PrepareStack>::operator()(
 }
 
 void Sysdeps<PrepareStackCleanup>::operator()(
-	void *stack, size_t stack_size, void *stack_base, size_t guard_size
+    void *stack, size_t stack_size, void *stack_base, size_t guard_size
 ) {
 	(void)stack_size;
 	(void)stack_base;
@@ -5516,24 +6363,25 @@ int Sysdeps<Clone>::operator()(void *tcb, pid_t *pid_out, void *stack) {
 	return 0;
 }
 
-void Sysdeps<TcbDestroy>::operator()(void *tcb) {
-	destroyTcb(static_cast<Tcb *>(tcb));
-}
+void Sysdeps<TcbDestroy>::operator()(void *tcb) { destroyTcb(static_cast<Tcb *>(tcb)); }
 
 int Sysdeps<Execve>::operator()(const char *path, char *const argv[], char *const envp[]) {
 	int executable_fd = -1;
 	int error = naos_native::open_path(path, O_RDONLY, 0, &executable_fd);
-	if (error != 0)
+	if (error != 0) {
 		return error;
+	}
 
 	const auto source = naos_native::handle_for_fd(executable_fd);
 	na_handle_t executable = NA_HANDLE_INVALID;
-	const auto duplicate_status = _na_handle_duplicate(source, 0, &executable);
+	// File/Directory client ends are unique capabilities. Materialize an
+	// immutable executable snapshot before invoking the kernel exec path.
+	const int materialize_error = naos_native::materialize_file(source, executable);
 	const int close_error = naos_native::close_fd(executable_fd);
-	if (duplicate_status != NA_STATUS_OK) {
+	if (materialize_error != 0) {
 		if (close_error != 0)
 			return close_error;
-		return naos_native::status_errno(duplicate_status);
+		return materialize_error;
 	}
 	if (close_error != 0) {
 		_na_handle_close(executable);
@@ -5546,6 +6394,11 @@ int Sysdeps<Execve>::operator()(const char *path, char *const argv[], char *cons
 	frame.path = reinterpret_cast<uint64_t>(path);
 	frame.argv = reinterpret_cast<uint64_t>(argv);
 	frame.envp = reinterpret_cast<uint64_t>(envp);
+	// The new image has fresh mlibc globals and must receive the existing
+	// namespace capabilities from the kernel on its first bootstrap call.
+	frame.root_directory = naos_native::root_directory();
+	frame.current_directory = naos_native::current_directory();
+	frame.service_directory = naos_native::service_directory;
 	naos_native::close_cloexec();
 	const int64_t status = _na_process_exec(&frame);
 	_na_handle_close(executable);
@@ -5612,7 +6465,7 @@ int Sysdeps<GetCwd>::operator()(char *buffer, size_t size) {
 	naos_native::call_result result;
 	naos::system::Directory::path_request request{};
 	const int error = naos_native::encoded_native_call(
-	    naos_native::current_directory,
+	    naos_native::current_directory(),
 	    NA_METHOD_DIRECTORY_PATH,
 	    request,
 	    naos::system::Directory::encode_path_request,
@@ -5633,52 +6486,52 @@ int Sysdeps<GetCwd>::operator()(char *buffer, size_t size) {
 }
 
 int Sysdeps<Chdir>::operator()(const char *path) {
-	int error;
 	na_handle_t directory = NA_HANDLE_INVALID;
-	error = naos_native::open_directory_handle(naos_native::current_directory, path, 0, directory);
+	int error =
+	    naos_native::open_directory_handle(naos_native::current_directory(), path, 0, directory);
 	if (error != 0)
 		return error;
-	error = naos_native::update_process_directory(directory, NA_METHOD_DIRECTORY_SET_CURRENT);
-	if (error != 0) {
+	// Runtime binding swap only: the peer's SET_CURRENT is a frozen no-op
+	// (PRD §5.3 item 4) and process directory state stays userland-owned.
+	naos_native::directory_binding *binding = naos_native::binding_acquire(directory, false);
+	if (binding == nullptr) {
 		_na_handle_close(directory);
-		return error;
+		return ENOMEM;
 	}
-	return naos_native::replace_current_directory(directory);
+	naos_native::set_current_binding(binding);
+	return 0;
 }
 
 int Sysdeps<Fchdir>::operator()(int fd) {
-	int error;
 	const auto source = naos_native::directory_for_fd(fd);
 	if (source == NA_HANDLE_INVALID)
 		return EBADF;
-	na_handle_t directory = NA_HANDLE_INVALID;
-	const auto status = _na_handle_duplicate(source, 0, &directory);
-	if (status != NA_STATUS_OK)
-		return naos_native::status_errno(status);
-	error = naos_native::update_process_directory(directory, NA_METHOD_DIRECTORY_SET_CURRENT);
-	if (error != 0) {
-		_na_handle_close(directory);
-		return error;
-	}
-	return naos_native::replace_current_directory(directory);
+	// PRD §5.2 rule: fchdir shares the descriptor's native handle via a
+	// counted claim; never duplicates a Directory handle.
+	naos_native::directory_binding *binding = naos_native::binding_acquire(source, true);
+	if (binding == nullptr)
+		return ENOMEM;
+	naos_native::set_current_binding(binding);
+	return 0;
 }
 
 int Sysdeps<Chroot>::operator()(const char *path) {
-	int error;
 	na_handle_t directory = NA_HANDLE_INVALID;
-	error = naos_native::open_directory_handle(
-	    naos_native::current_directory, path, NA_DIRECTORY_OPEN_FLAG_CHROOT, directory
+	int error = naos_native::open_directory_handle(
+	    naos_native::current_directory(), path, NA_DIRECTORY_OPEN_FLAG_CHROOT, directory
 	);
 	if (error != 0)
 		return error;
-	error = naos_native::update_process_directory(directory, NA_METHOD_DIRECTORY_SET_ROOT);
-	if (error != 0) {
+	// The CHROOT open flag yields an endpoint with the target as its visible
+	// root; root and cwd attach to that SAME binding (PRD §6.3).
+	naos_native::directory_binding *binding = naos_native::binding_acquire(directory, false);
+	if (binding == nullptr) {
 		_na_handle_close(directory);
-		return error;
+		return ENOMEM;
 	}
-	return naos_native::replace_root_directory(directory);
+	naos_native::set_root_and_current_binding(binding);
+	return 0;
 }
-
 int Sysdeps<OpenDir>::operator()(const char *path, int *handle) {
 	return naos_native::open_path(path, O_RDONLY | O_DIRECTORY, 0, handle);
 }
@@ -5700,14 +6553,27 @@ Sysdeps<ReadEntries>::operator()(int handle, void *buffer, size_t max_size, size
 	naos::system::Directory::list_request request{};
 	dirent *output = static_cast<dirent *>(buffer);
 	const uint64_t offset = static_cast<uint64_t>(output->d_off);
+	// The caller's buffer is the record budget: the service fills the region up
+	// to that and reports how many bytes it wrote.
+	uint64_t budget = max_size;
+	if (budget > NA_CHANNEL_MAX_MESSAGE_BYTES)
+		budget = NA_CHANNEL_MAX_MESSAGE_BYTES;
 	request.offset = offset;
-	request.requested_bytes = NA_CHANNEL_MAX_MESSAGE_BYTES;
+	request.requested_bytes = budget;
+	na_resource_disposition_t disposition{};
+	uint64_t window = 0;
+	int error = naos_native::prepare_bulk_region(budget, disposition, window);
+	if (error != 0)
+		return error;
+	request.buffer.value = 0;
 	naos_native::call_result result;
-	int error = naos_native::encoded_native_call(
+	error = naos_native::encoded_native_call_with_resources(
 	    directory,
 	    NA_METHOD_DIRECTORY_LIST,
 	    request,
 	    naos::system::Directory::encode_list_request,
+	    &disposition,
+	    1,
 	    result
 	);
 	if (error != 0)
@@ -5723,15 +6589,16 @@ Sysdeps<ReadEntries>::operator()(int handle, void *buffer, size_t max_size, size
 		naos_native::destroy_result(result);
 		return 0;
 	}
-	if (response.records.size < 16) {
+	const uint8_t *records = naos_native::thread_bulk_region.address;
+	if (response.bytes < 16) {
 		naos_native::destroy_result(result);
 		return EIO;
 	}
-	const uint64_t inode = naos_native::get_u64(response.records.data);
-	const uint32_t type = naos_native::get_u32(response.records.data + 8);
-	const uint32_t name_bytes = naos_native::get_u32(response.records.data + 12);
+	const uint64_t inode = naos_native::get_u64(records);
+	const uint32_t type = naos_native::get_u32(records + 8);
+	const uint32_t name_bytes = naos_native::get_u32(records + 12);
 	if (name_bytes == 0 || name_bytes > sizeof(output->d_name)
-	    || 16 + name_bytes > response.records.size) {
+	    || 16 + name_bytes > response.bytes) {
 		naos_native::destroy_result(result);
 		return EIO;
 	}
@@ -5756,7 +6623,7 @@ Sysdeps<ReadEntries>::operator()(int handle, void *buffer, size_t max_size, size
 			output->d_type = DT_REG;
 			break;
 	}
-	memcpy(output->d_name, response.records.data + 16, name_bytes);
+	memcpy(output->d_name, records + 16, name_bytes);
 	*bytes_read = sizeof(dirent);
 	naos_native::destroy_result(result);
 	return 0;
@@ -5775,7 +6642,7 @@ int Sysdeps<Rmdir>::operator()(const char *path) {
 	request.path = {reinterpret_cast<const uint8_t *>(path), static_cast<uint32_t>(length + 1)};
 	naos_native::call_result result;
 	error = naos_native::encoded_native_call(
-	    naos_native::current_directory,
+	    naos_native::current_directory(),
 	    NA_METHOD_DIRECTORY_REMOVE,
 	    request,
 	    naos::system::Directory::encode_remove_request,
@@ -5798,7 +6665,7 @@ int Sysdeps<Mkdir>::operator()(const char *path, mode_t mode) {
 	request.path = {reinterpret_cast<const uint8_t *>(path), static_cast<uint32_t>(length + 1)};
 	naos_native::call_result result;
 	error = naos_native::encoded_native_call(
-	    naos_native::current_directory,
+	    naos_native::current_directory(),
 	    NA_METHOD_DIRECTORY_CREATE,
 	    request,
 	    naos::system::Directory::encode_create_request,
@@ -5895,23 +6762,47 @@ int Sysdeps<Readlinkat>::operator()(
 int Sysdeps<Renameat>::operator()(
     int olddirfd, const char *old_path, int newdirfd, const char *new_path
 ) {
-	int error;
 	const auto old_directory = naos_native::directory_for_fd(olddirfd);
 	const auto new_directory = naos_native::directory_for_fd(newdirfd);
 	if (old_directory == NA_HANDLE_INVALID || new_directory == NA_HANDLE_INVALID)
 		return EBADF;
-	if (old_directory != new_directory)
-		return EXDEV;
 	naos_native::call_result result;
-	error = naos_native::directory_pair_call(
-	    old_directory, NA_METHOD_DIRECTORY_RENAME, old_path, new_path, result
-	);
+	int error;
+	if (naos_native::directory_supports_revision2()) {
+		error = naos_native::directory_pair_at_call(
+		    old_directory,
+		    new_directory,
+		    NA_METHOD_DIRECTORY_RENAME_AT,
+		    old_path,
+		    new_path,
+		    0,
+		    result
+		);
+	} else {
+		// Transitional fallback (Phase-4 removal): legacy single-directory
+		// RENAME with the "different dirfd handles means EXDEV" shortcut.
+		if (old_directory != new_directory)
+			return EXDEV;
+		error = naos_native::directory_pair_call(
+		    old_directory, NA_METHOD_DIRECTORY_RENAME, old_path, new_path, result
+		);
+	}
 	naos_native::destroy_result(result);
 	return error;
 }
 
 int Sysdeps<Rename>::operator()(const char *path, const char *new_path) {
-	return sysdep<Renameat>(AT_FDCWD, path, AT_FDCWD, new_path);
+	// rename(2) always uses the process cwd for both sides. Keep it on the
+	// single-directory protocol method so vfsd can route an absolute path into
+	// an external mount; renameat(2) uses revision-2 for explicit dirfd pairs.
+	if (path == nullptr || new_path == nullptr)
+		return EFAULT;
+	naos_native::call_result result;
+	const int error = naos_native::directory_pair_call(
+	    naos_native::current_directory(), NA_METHOD_DIRECTORY_RENAME, path, new_path, result
+	);
+	naos_native::destroy_result(result);
+	return error;
 }
 
 int Sysdeps<Link>::operator()(const char *old_path, const char *new_path) {
@@ -5923,17 +6814,33 @@ int Sysdeps<Linkat>::operator()(
 ) {
 	if ((flags & ~AT_SYMLINK_FOLLOW) != 0)
 		return EINVAL;
-	int error;
 	const auto old_directory = naos_native::directory_for_fd(olddirfd);
 	const auto new_directory = naos_native::directory_for_fd(newdirfd);
 	if (old_directory == NA_HANDLE_INVALID || new_directory == NA_HANDLE_INVALID)
 		return EBADF;
-	if (old_directory != new_directory)
-		return EXDEV;
 	naos_native::call_result result;
-	error = naos_native::directory_pair_call(
-	    old_directory, NA_METHOD_DIRECTORY_LINK, old_path, new_path, result
-	);
+	int error;
+	if (naos_native::directory_supports_revision2()) {
+		// link_at flags bit0 = AT_SYMLINK_FOLLOW semantics (frozen UAPI).
+		const uint64_t wire_flags = (flags & AT_SYMLINK_FOLLOW) != 0 ? 1 : 0;
+		error = naos_native::directory_pair_at_call(
+		    old_directory,
+		    new_directory,
+		    NA_METHOD_DIRECTORY_LINK_AT,
+		    old_path,
+		    new_path,
+		    wire_flags,
+		    result
+		);
+	} else {
+		// Transitional fallback (Phase-4 removal): legacy single-directory
+		// LINK with the "different dirfd handles means EXDEV" shortcut.
+		if (old_directory != new_directory)
+			return EXDEV;
+		error = naos_native::directory_pair_call(
+		    old_directory, NA_METHOD_DIRECTORY_LINK, old_path, new_path, result
+		);
+	}
 	naos_native::destroy_result(result);
 	return error;
 }
@@ -5981,10 +6888,30 @@ int Sysdeps<Fallocate>::operator()(int fd, off_t offset, size_t size) {
 }
 
 int Sysdeps<Fsync>::operator()(int fd) {
-	const auto file = naos_native::handle_for_fd(fd);
-	if (file == NA_HANDLE_INVALID)
+	const auto handle = naos_native::handle_for_fd(fd);
+	if (handle == NA_HANDLE_INVALID)
 		return EBADF;
-	return naos_native::file_value_call(file, NA_METHOD_FILE_SYNC, 0, 0, false, true);
+	na_handle_info_t info{};
+	info.struct_size = sizeof(info);
+	if (_na_handle_get_info(handle, &info) == NA_STATUS_OK && info.scope == NA_SCOPE_DIRECTORY) {
+		// fsync(dirfd) maps to Directory.sync (PRD §5.3 item 6); the old
+		// behavior sent FILE_SYNC to a directory endpoint and failed.
+		if (naos_native::directory_supports_revision2()) {
+			naos::system::Directory::sync_request request{};
+			naos_native::call_result result;
+			const int error = naos_native::encoded_native_call(
+			    handle,
+			    NA_METHOD_DIRECTORY_SYNC,
+			    request,
+			    naos::system::Directory::encode_sync_request,
+			    result
+			);
+			naos_native::destroy_result(result);
+			return error;
+		}
+		// Transitional fallback (Phase-4 removal): legacy mis-mapped FILE sync.
+	}
+	return naos_native::file_value_call(handle, NA_METHOD_FILE_SYNC, 0, 0, false, true);
 }
 
 int Sysdeps<Fdatasync>::operator()(int fd) { return sysdep<Fsync>(fd); }
@@ -6058,6 +6985,46 @@ int Sysdeps<Stat>::operator()(
 		return EFAULT;
 	int temporary_fd = -1;
 	if (fsfdt != fsfd_target::fd) {
+		// Path-form query: prefer Directory.stat_node (revision 2), which
+		// honors AT_SYMLINK_NOFOLLOW on the final component and returns
+		// ENOENT for missing paths without opening anything.
+		if (path != nullptr && naos_native::directory_supports_revision2()) {
+			const size_t length = strlen(path);
+			if (length >= 4095)
+				return ENAMETOOLONG;
+			const na_handle_t directory = fsfdt == fsfd_target::fd_path
+			                                  ? naos_native::directory_for_fd(fd)
+			                                  : naos_native::current_directory();
+			if (directory == NA_HANDLE_INVALID)
+				return EBADF;
+			naos::system::Directory::stat_node_request request{};
+			request.flags =
+			    (flags & AT_SYMLINK_NOFOLLOW) != 0 ? NA_DIRECTORY_LOOKUP_FLAG_NOFOLLOW : 0;
+			request.path_size = length;
+			request.path = {reinterpret_cast<const uint8_t *>(path), static_cast<uint32_t>(length)};
+			naos_native::call_result result;
+			int error = naos_native::encoded_native_call(
+			    directory,
+			    NA_METHOD_DIRECTORY_STAT_NODE,
+			    request,
+			    naos::system::Directory::encode_stat_node_request,
+			    result
+			);
+			if (error == 0) {
+				naos::system::Directory::stat_node_response response{};
+				if (!naos::system::Directory::decode_stat_node_response(
+				        result.bytes, result.byte_count, response
+				    )) {
+					error = EIO;
+				} else {
+					naos_native::assign_stat(response.value, *statbuf);
+				}
+			}
+			naos_native::destroy_result(result);
+			return error;
+		}
+		// Transitional fallback (Phase-4 removal): open+stat simulation; it
+		// follows symlinks unconditionally and resolves relative to cwd only.
 		int error = naos_native::open_path(path, O_RDONLY, 0, &temporary_fd);
 		if (error != 0)
 			return error;

@@ -24,11 +24,13 @@ naos_generated_dir = naos_generated_include_dir / 'naos/generated/system'
 naos_generated_index = naos_generated_include_dir / 'naos/generated/system_uapi.h'
 naos_idl_template_dir = naos_idl_root / 'templates/cpp/naoidl'
 naos_idl_sources = [
+	naos_idl_source_dir / 'block_device.naidl',
+	naos_idl_source_dir / 'block_device_factory.naidl',
 	naos_idl_source_dir / 'directory.naidl',
 	naos_idl_source_dir / 'file.naidl',
 	naos_idl_source_dir / 'memory_object.naidl',
+	naos_idl_source_dir / 'mount_ticket.naidl',
 	naos_idl_source_dir / 'process.naidl',
-	naos_idl_source_dir / 'shared_ring.naidl',
 	naos_idl_source_dir / 'service_directory.naidl',
 	naos_idl_source_dir / 'stream.naidl',
 	naos_idl_source_dir / 'input_event_source.naidl',
@@ -38,6 +40,7 @@ naos_idl_sources = [
 	naos_idl_source_dir / 'terminal_manager.naidl',
 	naos_idl_source_dir / 'terminal_master.naidl',
 	naos_idl_source_dir / 'terminal_slave.naidl',
+	naos_idl_source_dir / 'vfs.naidl',
 ]
 naos_idl_templates = [
 	naos_idl_template_dir / 'client.hpp.htt',
