@@ -57,6 +57,15 @@ DIR *fdopendir(int fd) {
 	return dir;
 }
 
+static void prepare_read_entries(DIR *dir) {
+	// ReadEntries uses the first buffer entry as the directory cursor.  A
+	// batch leaves that entry in the cache after readdir() has consumed the
+	// whole batch, so refresh its cursor from the last entry returned to the
+	// caller before asking the service for the next batch.
+	auto entp = reinterpret_cast<struct dirent *>(dir->__ent_buffer);
+	entp->d_off = static_cast<off_t>(dir->__seek_offset);
+}
+
 DIR *opendir(const char *path) {
 	auto dir = frg::construct<__mlibc_dir_struct>(getAllocator());
 	__ensure(dir);
@@ -77,6 +86,7 @@ DIR *opendir(const char *path) {
 struct dirent *readdir(DIR *dir) {
 	__ensure(dir->__ent_next <= dir->__ent_limit);
 	if(dir->__ent_next == dir->__ent_limit) {
+		prepare_read_entries(dir);
 		if(int e = mlibc::sysdep_or_enosys<ReadEntries>(dir->__handle, dir->__ent_buffer, 2048, &dir->__ent_limit); e)
 			__ensure(!"mlibc::sys_read_entries() failed");
 		dir->__ent_next = 0;
@@ -118,6 +128,7 @@ int readdir_r(DIR *dir, struct dirent *entry, struct dirent **result) {
 
 	__ensure(dir->__ent_next <= dir->__ent_limit);
 	if(dir->__ent_next == dir->__ent_limit) {
+		prepare_read_entries(dir);
 		if(int e = mlibc::sysdep_or_panic<ReadEntries>(dir->__handle, dir->__ent_buffer, 2048, &dir->__ent_limit); e)
 			__ensure(!"mlibc::sys_read_entries() failed");
 		dir->__ent_next = 0;

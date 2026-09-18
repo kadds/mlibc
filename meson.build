@@ -31,6 +31,7 @@ naos_idl_sources = [
 	naos_idl_source_dir / 'memory_object.naidl',
 	naos_idl_source_dir / 'mount_ticket.naidl',
 	naos_idl_source_dir / 'process.naidl',
+	naos_idl_source_dir / 'system_status.naidl',
 	naos_idl_source_dir / 'service_directory.naidl',
 	naos_idl_source_dir / 'stream.naidl',
 	naos_idl_source_dir / 'input_event_source.naidl',
