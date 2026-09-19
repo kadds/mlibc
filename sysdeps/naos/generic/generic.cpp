@@ -810,36 +810,43 @@ int clone_directory_binding(na_handle_t directory, na_handle_t &clone) {
 	return 0;
 }
 
-// Materialize a regular-file snapshot into a read-only MemoryObject
-// (File.revision 4 materialize, PRD §5.3 item 1). Used for MAP_PRIVATE file
-// mappings; the returned handle is consumed (closed) by the caller.
+// Create a lazy, read-only MemoryObject sized from the File endpoint. The
+// caller supplies the same File capability as the pager on the existing map or
+// process-spawn boundary; no file payload is copied here.
 int materialize_file(na_handle_t file, na_handle_t &memory_object) {
 	memory_object = NA_HANDLE_INVALID;
 	if (file == NA_HANDLE_INVALID)
 		return EBADF;
-	naos::system::File::materialize_request request{};
+	naos::system::File::stat_request request{};
 	call_result result{};
 	const int error = encoded_native_call(
 	    file,
-	    NA_METHOD_FILE_MATERIALIZE,
+	    NA_METHOD_FILE_STAT,
 	    request,
-	    naos::system::File::encode_materialize_request,
+	    naos::system::File::encode_stat_request,
 	    result
 	);
 	if (error != 0) {
 		destroy_result(result);
 		return error;
 	}
-	naos::system::File::materialize_response response{};
-	if (!naos::system::File::decode_materialize_response(result.bytes, result.byte_count, response)
-	    || response.object.value >= result.resource_count) {
+	naos::system::File::stat_response response{};
+	if (!naos::system::File::decode_stat_response(result.bytes, result.byte_count, response)
+	    || result.resource_count != 0) {
 		destroy_result(result);
 		return EIO;
 	}
-	memory_object = result.resources[response.object.value];
-	result.resources[response.object.value] = NA_HANDLE_INVALID;
+	if (response.value.size <= 0) {
+		destroy_result(result);
+		return EINVAL;
+	}
+	const auto size = static_cast<uint64_t>(response.value.size);
+	if (size > NA_MEMORY_OBJECT_MAX_BYTES) {
+		destroy_result(result);
+		return EFBIG;
+	}
 	destroy_result(result);
-	return 0;
+	return naos_syscall_error(_na_memory_create(size, NA_MEMORY_FLAG_READ_ONLY, &memory_object));
 }
 
 void reset_after_fork() {
@@ -4343,20 +4350,22 @@ int native_spawn_stdio_internal(
 	}
 	const auto source = handle_for_fd(executable_fd);
 	na_handle_t executable = NA_HANDLE_INVALID;
-	// File/Directory client ends are unique capabilities. Materialize the
-	// executable as an immutable MemoryObject before Process.spawn so the
-	// child receives a transferable executable capability without relying on
-	// the legacy kernel File duplicate path.
+	const na_handle_t pager = source;
+	auto close_executable = [&] {
+		if (executable_fd < 0)
+			return 0;
+		const int status = close_fd(executable_fd);
+		executable_fd = -1;
+		return status;
+	};
+	// Keep the executable shape in a read-only MemoryObject and pass the File
+	// client separately as its lazy pager.
 	const int materialize_error = materialize_file(source, executable);
-	const int close_error = close_fd(executable_fd);
 	if (materialize_error != 0) {
+		const int close_error = close_executable();
 		if (close_error != 0)
 			return close_error;
 		return materialize_error;
-	}
-	if (close_error != 0) {
-		_na_handle_close(executable);
-		return close_error;
 	}
 
 	const na_handle_t stdio_handles[3] = {
@@ -4366,6 +4375,7 @@ int native_spawn_stdio_internal(
 	};
 	if (stdio_handles[0] == NA_HANDLE_INVALID || stdio_handles[1] == NA_HANDLE_INVALID
 	    || stdio_handles[2] == NA_HANDLE_INVALID) {
+		close_executable();
 		_na_handle_close(executable);
 		return EBADF;
 	}
@@ -4399,6 +4409,7 @@ int native_spawn_stdio_internal(
 					_na_handle_close(stdio_duplicates[j]);
 			}
 			_na_handle_close(executable);
+			close_executable();
 			return duplicate_error;
 		}
 		stdio_resource_indices[i] = stdio_resource_count++;
@@ -4416,6 +4427,7 @@ int native_spawn_stdio_internal(
 	if (status != NA_STATUS_OK) {
 		close_stdio_duplicates();
 		_na_handle_close(executable);
+		close_executable();
 		return status_errno(status);
 	}
 
@@ -4430,6 +4442,7 @@ int native_spawn_stdio_internal(
 	// it must not change the kernel handoff ordering.
 	spawn.flags = NA_PROCESS_SPAWN_DEFERRED_START;
 	spawn.executable = executable;
+	spawn.pager = pager;
 	spawn.bootstrap_endpoint = child_endpoint;
 	spawn.path = reinterpret_cast<uint64_t>(path);
 	spawn.argv = reinterpret_cast<uint64_t>(argv);
@@ -4440,10 +4453,12 @@ int native_spawn_stdio_internal(
 	if (spawn_status != 0) {
 		close_stdio_duplicates();
 		_na_handle_close(executable);
+		close_executable();
 		_na_handle_close(child_endpoint);
 		_na_handle_close(parent_endpoint);
 		return naos_syscall_error(spawn_status);
 	}
+	(void)close_executable();
 
 	// The registry capability is an independent bootstrap decision. Every
 	// child receives a restricted view; a terminal service manager receives
@@ -4455,6 +4470,7 @@ int native_spawn_stdio_internal(
 		(void)start_process_capability(process);
 		_na_handle_close(process);
 		_na_handle_close(executable);
+		close_executable();
 		close_stdio_duplicates();
 		return EACCES;
 	}
@@ -4469,6 +4485,7 @@ int native_spawn_stdio_internal(
 		(void)start_process_capability(process);
 		_na_handle_close(process);
 		_na_handle_close(executable);
+		close_executable();
 		close_stdio_duplicates();
 		return EACCES;
 	}
@@ -4550,6 +4567,7 @@ int native_spawn_stdio_internal(
 		close_cloned_directories();
 		close_stdio_duplicates();
 		(void)start_process_capability(process);
+		close_executable();
 		_na_handle_close(process);
 		return status_errno(status);
 	}
@@ -4558,10 +4576,14 @@ int native_spawn_stdio_internal(
 	} else {
 		const int start_error = start_process_capability(process);
 		_na_handle_close(process);
-		if (start_error != 0)
+		if (start_error != 0) {
 			return start_error;
+		}
 	}
 	*pid = static_cast<pid_t>(native_pid);
+	// The pager is the original executable fd capability. It was retained by
+	// the kernel's MemoryObject and the process-side fd is closed above after
+	// the spawn handoff.
 	return 0;
 }
 
@@ -6619,10 +6641,10 @@ int Sysdeps<VmMap>::operator()(
 		frame.object = naos_native::handle_for_fd(fd);
 		if (frame.object == NA_HANDLE_INVALID)
 			return EBADF;
-		// MAP_PRIVATE regular-file mapping (PRD §5.4): materialize an
-		// immutable snapshot via File.materialize (revision 4) and map the
-		// returned MemoryObject instead of taking the kernel VFS file-mapping
-		// path. MAP_SHARED and anonymous mappings are untouched.
+		// MAP_PRIVATE regular-file mapping: obtain only the file size, create a
+		// read-only MemoryObject, and let the kernel page it through the File
+		// capability one page at a time. MAP_SHARED and anonymous mappings are
+		// untouched.
 		if (!(flags & MAP_SHARED)
 		    && naos_native::file_materialize_state
 		           != naos_native::file_materialize_support::unavailable) {
@@ -6630,10 +6652,12 @@ int Sysdeps<VmMap>::operator()(
 			info.struct_size = sizeof(info);
 			if (_na_handle_get_info(frame.object, &info) == NA_STATUS_OK
 			    && info.scope == NA_SCOPE_FILE) {
+				const na_handle_t file_pager = frame.object;
 				const int materialize_error =
 				    naos_native::materialize_file(frame.object, materialized_object);
 				if (materialize_error == 0) {
 					frame.object = materialized_object;
+					frame.pager = file_pager;
 					naos_native::file_materialize_state =
 					    naos_native::file_materialize_support::available;
 				} else if (materialize_error == ENOTSUP || materialize_error == EPROTO) {
@@ -6760,23 +6784,28 @@ int Sysdeps<Execve>::operator()(const char *path, char *const argv[], char *cons
 
 	const auto source = naos_native::handle_for_fd(executable_fd);
 	na_handle_t executable = NA_HANDLE_INVALID;
-	// File/Directory client ends are unique capabilities. Materialize an
-	// immutable executable snapshot before invoking the kernel exec path.
+	const na_handle_t pager = source;
+	auto close_executable = [&] {
+		if (executable_fd < 0)
+			return 0;
+		const int status = naos_native::close_fd(executable_fd);
+		executable_fd = -1;
+		return status;
+	};
+	// Keep the executable shape in a read-only MemoryObject and pass the File
+	// client separately as its lazy pager.
 	const int materialize_error = naos_native::materialize_file(source, executable);
-	const int close_error = naos_native::close_fd(executable_fd);
 	if (materialize_error != 0) {
+		const int close_error = close_executable();
 		if (close_error != 0)
 			return close_error;
 		return materialize_error;
-	}
-	if (close_error != 0) {
-		_na_handle_close(executable);
-		return close_error;
 	}
 
 	na_process_exec_frame_t frame{};
 	frame.struct_size = sizeof(frame);
 	frame.executable = executable;
+	frame.pager = pager;
 	frame.path = reinterpret_cast<uint64_t>(path);
 	frame.argv = reinterpret_cast<uint64_t>(argv);
 	frame.envp = reinterpret_cast<uint64_t>(envp);
@@ -6788,6 +6817,7 @@ int Sysdeps<Execve>::operator()(const char *path, char *const argv[], char *cons
 	naos_native::close_cloexec();
 	const int64_t status = _na_process_exec(&frame);
 	_na_handle_close(executable);
+	(void)close_executable();
 	return naos_syscall_error(status);
 }
 
@@ -6827,8 +6857,31 @@ Sysdeps<Waitpid>::operator()(pid_t pid, int *status, int flags, struct rusage *r
 	if (error != 0)
 		return error;
 	naos::system::Process::wait_response response{};
-	if (!naos::system::Process::decode_wait_response(result.bytes, result.byte_count, response)
-	    || result.resource_count != 0) {
+	bool decoded = false;
+	if (pid > 0) {
+		decoded = naos::system::Process::decode_wait_response(result.bytes, result.byte_count, response);
+	} else {
+		naos::system::Process::wait_children_response children{};
+		decoded = naos::system::Process::decode_wait_children_response(result.bytes, result.byte_count, children);
+		if (decoded) {
+			response.status = children.status;
+			response.pid = children.pid;
+			response.user_time_us = children.user_time_us;
+			response.system_time_us = children.system_time_us;
+			response.page_faults = children.page_faults;
+			response.peak_rss_pages = children.peak_rss_pages;
+			response.page_size = children.page_size;
+			response.user_stack_pages = children.user_stack_pages;
+			response.file_inputs = children.file_inputs;
+			response.file_outputs = children.file_outputs;
+			response.signals_delivered = children.signals_delivered;
+			response.voluntary_context_switches = children.voluntary_context_switches;
+			response.involuntary_context_switches = children.involuntary_context_switches;
+			response.text_pages = children.text_pages;
+			response.resident_pages = children.resident_pages;
+		}
+	}
+	if (!decoded || result.resource_count != 0) {
 		naos_native::destroy_result(result);
 		return EIO;
 	}
@@ -6842,6 +6895,23 @@ Sysdeps<Waitpid>::operator()(pid_t pid, int *status, int flags, struct rusage *r
 		ru->ru_utime.tv_usec = response.user_time_us % 1'000'000;
 		ru->ru_stime.tv_sec = response.system_time_us / 1'000'000;
 		ru->ru_stime.tv_usec = response.system_time_us % 1'000'000;
+		// NaOS currently exposes one aggregate VM fault counter.  Report it as
+		// minor faults; major-vs-minor classification will be added when the
+		// pager/block path exposes physical-I/O fault attribution.
+		ru->ru_minflt = static_cast<long>(response.page_faults);
+		ru->ru_majflt = 0;
+		if (response.page_size != 0)
+			ru->ru_maxrss = static_cast<long>((response.peak_rss_pages * response.page_size) / 1024);
+		if (response.page_size != 0) {
+			ru->ru_isrss = static_cast<long>((response.user_stack_pages * response.page_size) / 1024);
+			ru->ru_ixrss = static_cast<long>((response.text_pages * response.page_size) / 1024);
+			ru->ru_idrss = static_cast<long>((response.resident_pages * response.page_size) / 1024);
+		}
+		ru->ru_inblock = static_cast<long>(response.file_inputs);
+		ru->ru_oublock = static_cast<long>(response.file_outputs);
+		ru->ru_nsignals = static_cast<long>(response.signals_delivered);
+		ru->ru_nvcsw = static_cast<long>(response.voluntary_context_switches);
+		ru->ru_nivcsw = static_cast<long>(response.involuntary_context_switches);
 	}
 	naos_native::destroy_result(result);
 	return 0;
